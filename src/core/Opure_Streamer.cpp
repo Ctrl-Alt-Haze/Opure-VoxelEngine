@@ -37,6 +37,9 @@ Dtype ParseDtype(std::string_view s)
     if (s == "BF16") { return Dtype::BF16; }
     if (s == "U8")   { return Dtype::U8;   }
     if (s == "I8")   { return Dtype::I8;   }
+    if (s == "U4")   { return Dtype::U4;   }
+    if (s == "I4")   { return Dtype::I4;   }
+    if (s == "I8")   { return Dtype::I8;   }
     ThrowError("unsupported safetensors dtype '" + std::string(s) + "'");
 }
 
@@ -92,6 +95,8 @@ const char* DtypeName(Dtype d)
     case Dtype::BF16: return "BF16";
     case Dtype::U8:   return "U8";
     case Dtype::I8:   return "I8";
+    case Dtype::U4:   return "U4";
+    case Dtype::I4:   return "I4";
     default:          return "?";
     }
 }
@@ -105,6 +110,8 @@ uint32_t ElementBytes(Dtype d)
     case Dtype::BF16: return 4u;   // F32 and the two 16-bit forms widen to a word
     case Dtype::U8:
     case Dtype::I8:   return 1u;
+    case Dtype::U4:
+    case Dtype::I4:   return 1u;   // 2 elements per byte, but we widen to F32 (4 bytes each)
     default:          return 0u;
     }
 }
@@ -383,6 +390,31 @@ uint64_t WidenToF32(Dtype dt, const void* src, uint64_t elementCount, float* out
         // Copy as raw bytes; the caller treats the region as uint32 words.
         std::memcpy(out, s, elementCount);
         return elementCount;
+
+    case Dtype::U4:
+    case Dtype::I4:
+    {
+        // INT4 packs 2 elements per byte (high nibble first, then low nibble).
+        // Each 4-bit value is sign-extended to F32.
+        // For U4: values 0-15. For I4: values -8..7 (sign bit at bit 3).
+        const bool isSigned = (dt == Dtype::I4);
+        for (uint64_t i = 0; i < elementCount; ++i)
+        {
+            uint8_t byte = s[i >> 1];
+            uint8_t nibble = (i & 1) ? (byte & 0x0F) : (byte >> 4);
+            if (isSigned)
+            {
+                // Sign-extend 4-bit to 32-bit float
+                int val = (nibble & 0x8) ? (int)nibble - 16 : (int)nibble;
+                out[i] = static_cast<float>(val);
+            }
+            else
+            {
+                out[i] = static_cast<float>(nibble);
+            }
+        }
+        return elementCount * 4;
+    }
 
     default:
         ThrowError("WidenToF32 cannot widen this dtype");

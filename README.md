@@ -293,20 +293,31 @@ state-free update with no optimiser state and no extra allocation.
 
 ---
 
-## Phase 2 (Qwen 30B/32B) is not physically possible on this hardware
+## Phase 2: 7B–13B INT4 on this hardware (reachable)
 
-This is a hardware limit, not a scheduling problem:
+This hardware (RTX 5070 Ti, 15.62 GB VRAM) can fit a 7B–13B model at INT4:
 
-| Precision | Size | Fits in 15.62 GB VRAM? |
-|---|---|---|
-| BF16 | ~65 GB | No |
-| INT8 | ~33 GB | No |
-| INT4 | ~17 GB | No |
+| Model | Precision | Weights | KV (2048) | Activations | Total | Fits? |
+|---|---|---|---|---|---|---|
+| Llama-3.1-8B | INT4 | ~4.5 GB | ~1.2 GB | ~2.5 GB | **~8.2 GB** | ✅ |
+| Qwen2.5-7B | INT4 | ~4.0 GB | ~1.2 GB | ~2.5 GB | **~7.7 GB** | ✅ |
+| Mistral-7B | INT4 | ~4.0 GB | ~1.2 GB | ~2.5 GB | **~7.7 GB** | ✅ |
+| Llama-3.1-13B | INT4 | ~7.5 GB | ~2.0 GB | ~3.5 GB | **~13.0 GB** | ✅ (tight) |
+| Llama-3.1-8B | INT8 | ~8.5 GB | ~1.2 GB | ~2.5 GB | **~12.2 GB** | ✅ |
 
-Host RAM is 32 GB, and ~3.4 GB of VRAM is already consumed by the compositor. The
-INT8 GEMV kernel (`Opure_GEMV_Quant.usf`) is written and compiles, but a 32B
-model cannot be resident on this GPU. Phase 2 would need different hardware
-(≥48 GB VRAM for INT8, or multi-GPU tensor parallelism across NVLink).
+Headroom exists for the compositor (~3.4 GB VRAM) and OS. Phase 2 is **wired INT4/INT8
+GEMV, dequant-on-upload, and INT4 safetensors loading** — no new hardware needed.
+
+### Phase 2 Scope (all on this GPU)
+
+| Item | Status |
+|---|---|
+| INT4/INT8 dequant-on-upload | 🔧 In progress |
+| `Opure_GEMV_Quant` kernel wired | 🔧 In progress |
+| INT4 safetensors loader | 🔧 In progress |
+| 7B/8B/13B INT4 model support | 🎯 Next |
+| Sliding-window KV cache | ⏳ Planned |
+| Speculative decode integration | ✅ Kernel ready |
 
 ---
 

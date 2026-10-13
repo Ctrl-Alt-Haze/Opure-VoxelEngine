@@ -51,6 +51,8 @@ enum class Dtype : uint8_t
     BF16,  // 2 bytes/elt -- widened to F32 on load (shift left 16)
     U8,    // 1 byte/elt -- left raw, 4 elts/word, for GEMV_Quant
     I8,    // 1 byte/elt -- left raw, 4 elts/word, for GEMV_Quant
+    U4,    // 0.5 byte/elt -- 2 uint4 per byte, widened to F32 on load
+    I4,    // 0.5 byte/elt -- 2 int4 per byte, widened to F32 on load
     Count
 };
 
