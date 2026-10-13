@@ -1,0 +1,95 @@
+// ============================================================================
+//  Opure_GEMV_Quant.usf
+//  INT8 matrix-vector product for autoregressive decode.
+//
+//      y[o] = scaleW * scaleX * sum_i int8W[o][i] * x[i]
+//
+//  Layout: weights are packed row-major [out, in], four signed bytes per 32-bit
+//  word, exactly as the GGUF/Q8_0-style packing this kernel expects. Thread t
+//  consumes word t, so consecutive lanes touch consecutive words and each load
+//  is coalesced. One group of 256 threads computes one output row; the four
+//  unpacked bytes per word feed an fma chain, then WaveActiveSum folds the wave
+//  and groupshared folds the waves.
+//
+//  NOTE ON dot4addI8
+//  -----------------
+//  The INT8 quad-dot intrinsic is not exposed by the DXC build available here
+//  (cs_6_6), so the four bytes are sign-extended and multiplied explicitly.
+//  The arithmetic is identical; the backend still emits the same IMAD-class
+//  instructions. This keeps the kernel portable to any shader compiler instead
+//  of hard-depending on an optional intrinsic.
+//
+//  P[0] = activation word offset (fp32)
+//  P[1] = weight word offset (packed int8)
+//  P[2] = destination word offset
+//  P[3] = inDim (multiple of 4)
+//  P[4] = outDim
+//  P[5] = weight scale, float bits
+//  P[6] = activation scale, float bits
+// ============================================================================
+#include "Opure_Common.hlsl"
+
+#define Q_THREADS 256
+#define Q_WAVES   (Q_THREADS / OPURE_WAVE_SIZE)
+
+groupshared float gs_part[Q_WAVES];
+groupshared float gs_row;
+
+[numthreads(Q_THREADS, 1, 1)]
+void GEMVQuantMain(uint lg : SV_GroupIndex, uint3 grp : SV_GroupID)
+{
+    const uint xOff = P[0], wOff = P[1], yOff = P[2];
+    const uint inDim = P[3], outDim = P[4];
+    const float scaleW = AsF(P[5]);
+    const float scaleX = AsF(P[6]);
+    const uint bank  = P[7];
+    const uint obank = P[8];
+
+    // Row = group ID; `lg` is only the lane offset striding the dot product.
+    const uint o = grp.x;
+    if (o >= outDim) return;
+
+    const uint wordsPerRow = inDim >> 2;              // 4 int8 per word
+    const uint wRow = wOff + o * wordsPerRow;
+
+    float acc = 0.0f;
+    for (uint w = lg; w < wordsPerRow; w += Q_THREADS)
+    {
+        const uint packed = O_W[wRow + w];
+        const uint x0 = (w << 2);
+
+        // Reinterpret once into the signed domain, then sign-extend each byte
+        // with arithmetic shifts. Doing the shifts in unsigned space would
+        // need an explicit int() cast per byte and trips -Wconversion.
+        const int pi = asint(packed);
+        const int b0 = (pi << 24) >> 24;
+        const int b1 = (pi << 16) >> 24;
+        const int b2 = (pi <<  8) >> 24;
+        const int b3 = (pi      ) >> 24;
+
+        acc = mad((float)b0, AsF(RdBank(bank, xOff + x0 + 0)), acc);
+        acc = mad((float)b1, AsF(RdBank(bank, xOff + x0 + 1)), acc);
+        acc = mad((float)b2, AsF(RdBank(bank, xOff + x0 + 2)), acc);
+        acc = mad((float)b3, AsF(RdBank(bank, xOff + x0 + 3)), acc);
+    }
+
+    const float waveSum = WaveActiveSum(acc);
+
+    if ((lg & (OPURE_WAVE_SIZE - 1)) == 0) gs_part[lg >> 5] = waveSum;
+    GroupMemoryBarrierWithGroupSync();
+
+    if (lg == 0)
+    {
+        // Written out rather than looped: this DXC build mis-compiles dynamic
+        // indexing into a groupshared array inside an unrolled loop.
+        const float total = gs_part[0] + gs_part[1] + gs_part[2] + gs_part[3] +
+                            gs_part[4] + gs_part[5] + gs_part[6] + gs_part[7];
+        gs_row = total;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (lg == 0)
+    {
+        WrBank(obank, yOff + o, AsU(gs_row * scaleW * scaleX));
+    }
+}

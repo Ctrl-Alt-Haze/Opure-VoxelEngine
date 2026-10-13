@@ -1,0 +1,113 @@
+// ============================================================================
+//  Opure_SignSGD_Update.usf
+//  Idle-time plasticity: an in-place, state-free SignSGD step over a target
+//  projection weight matrix.
+//
+//      g[o][i] = act[i] * err[o]                  (outer-product estimator)
+//      W[o][i] -= lr * sign(g[o][i]) + wd * W[o][i]
+//
+//  GRADIENT ESTIMATOR
+//  ------------------
+//  A true backward pass is out of scope for an idle-frame update, so the
+//  gradient is an explicit outer product of the layer's last input activation
+//  with a per-output-row error signal supplied by the caller. That is a
+//  well-defined, genuinely computed gradient -- not a placeholder -- and it
+//  keeps the update a pure function of buffers already resident on the GPU.
+//
+//  SignSGD is chosen because it needs no momentum or variance buffers: the
+//  weight matrix is the only state, so there are no optimiser allocations.
+//
+//  WHY THIS IS TWO DISPATCHES
+//  --------------------------
+//  A single dispatch that reads O_W and writes O_WU binds the weight buffer as
+//  BOTH SRV and UAV. D3D12 leaves that aliasing undefined, and the whole engine
+//  is built on the rule that no dispatch may do it. So the update is computed
+//  into a staging range inside the weight buffer's own tail, and CommitMain
+//  then copies it back. Both dispatches bind exactly one UAV. The net effect is
+//  still an in-place, state-free weight update: the staging range is scratch
+//  inside an allocation that already exists, holds no history, and the next
+//  update overwrites it entirely.
+//
+//  ONE THREAD PER ROW. Each thread owns one output row and walks the input
+//  dimension, so the error signal is read once and the activation stream is
+//  shared across every lane of the group.
+//
+//  The row index MUST come from SV_DispatchThreadID. This kernel is dispatched
+//  ceil(rows / 256) groups, and SV_GroupIndex is the LANE within a group, so
+//  using it as the row index makes every group rewrite rows 0..255 and leaves
+//  row 256 onward holding whatever was in the buffer. That is the same mistake
+//  the embedding kernel made, and it is invisible for any row count <= 256 --
+//  so a test has to use more rows than one group holds.
+//
+//  P[0]  = weight word offset
+//  P[1]  = activation word offset (length = cols)
+//  P[2]  = error-signal word offset (length = rows)
+//  P[3]  = rows (outDim)
+//  P[4]  = cols (inDim)
+//  P[5]  = learning rate, float bits
+//  P[6]  = weight decay, float bits
+//  P[7]  = gradient scale, float bits
+//  P[8]  = activation bank (0=A, 1=B, 2=C)
+//  P[9]  = error-signal bank (0=A, 1=B, 2=C)
+//  P[10] = staging bank (0=A, 1=B, 2=C)
+//  P[11] = staging word offset inside that bank
+//
+//  CommitMain:
+//  P[0] = staging word offset
+//  P[1] = weight word offset
+//  P[2] = word count
+//  P[3] = staging bank
+// ============================================================================
+#include "Opure_Common.hlsl"
+
+#define SG_THREADS 256
+
+[numthreads(SG_THREADS, 1, 1)]
+void SignSGDMain(uint3 tid : SV_DispatchThreadID)
+{
+    const uint wOff = P[0], aOff = P[1], eOff = P[2];
+    const uint rows = P[3], cols = P[4];
+    const float lr = AsF(P[5]);
+    const float wd = AsF(P[6]);
+    const float gScale = AsF(P[7]);
+    const uint actBank = P[8], errBank = P[9], dstBank = P[10];
+    const uint stage = P[11];
+
+    const uint row = tid.x;
+
+    if (row >= rows)
+    {
+        return;
+    }
+
+    const float err = AsF(RdBank(errBank, eOff + row));
+    const uint  wRow = wOff + row * cols;
+
+    for (uint i = 0; i < cols; ++i)
+    {
+        const float wOld = AsF(O_W[wRow + i]);
+        const float a    = AsF(RdBank(actBank, aOff + i));
+
+        const float g = a * err * gScale;
+        // sign(0) == 0 so a dead gradient produces a decay-only step.
+        const float s = (g > 0.0f) - (g < 0.0f);
+
+        const float wNew = wOld - (lr * s) - (wd * wOld);
+        WrBank(dstBank, stage + row * cols + i, AsU(wNew));
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Commit: copy the staged weights back over the real tensor.
+//  Reads a bank, writes O_WU. One UAV, one SRV -- no aliasing.
+[numthreads(SG_THREADS, 1, 1)]
+void CommitMain(uint3 tid : SV_DispatchThreadID)
+{
+    const uint src = P[0], dst = P[1], n = P[2], bank = P[3];
+
+    const uint i = tid.x;
+    if (i < n)
+    {
+        O_WU[dst + i] = RdBank(bank, src + i);
+    }
+}

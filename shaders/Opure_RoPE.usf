@@ -1,0 +1,116 @@
+// ============================================================================
+//  Opure_RoPE.usf
+//  Rotary position embedding, applied to the query and key vectors just
+//  produced by the fused QKV projection. Keys are additionally appended to the
+//  paged KV cache together with the (un-rotated) values.
+//
+//  RoPE pairs adjacent channels (2i, 2i+1) of each head:
+//      q'[2i]   = q[2i]*cos(t) - q[2i+1]*sin(t)
+//      q'[2i+1] = q[2i]*sin(t) + q[2i+1]*cos(t)
+//  with t = position * theta^(-2i/headDim).
+//
+//  KV cache layout (per layer, within the shared KV buffer):
+//      base(layer) = layer * maxSeq * nKVHeads * headDim * 2
+//      K at [kvHead][seq][dim], V immediately after all K.
+//
+//  P[0]  = Q source word offset
+//  P[1]  = Q destination word offset
+//  P[2]  = K source word offset
+//  P[3]  = K destination word offset
+//  P[4]  = V source word offset
+//  P[5]  = KV cache word offset for this layer
+//  P[6]  = nHeads
+//  P[7]  = nKVHeads
+//  P[8]  = headDim
+//  P[9]  = maxSeq
+//  P[10] = position
+//  P[11] = RoPE theta, as float bit pattern
+//  P[12] = source bank (0=A, 1=B, 2=C)
+//  P[13] = destination bank (0=A, 1=B, 2=C); must differ from P[12]
+// ============================================================================
+#include "Opure_Common.hlsl"
+
+[numthreads(64, 1, 1)]
+void RoPEMain(uint3 tid : SV_DispatchThreadID)
+{
+    const uint qSrc = P[0],  qDst = P[1];
+    const uint kSrc = P[2],  kDst = P[3];
+    const uint vSrc = P[4],  kvOff = P[5];
+    const uint nH    = P[6],  nKV = P[7], hd = P[8], maxSeq = P[9];
+    const uint pos   = P[10];
+    const float theta = AsF(P[11]);
+    const uint bank  = P[12];
+    const uint obank = P[13];
+
+    const uint idx = tid.x;                 // head * (hd/2) + pair
+    const uint pairsPerHead = hd >> 1;
+    const uint totalQ = nH * pairsPerHead;
+
+    // theta^(-2i/hd) with i the pair index. Computed once per thread.
+    float freq = 0.0f;
+    float ct = 1.0f, st = 0.0f;
+    if (idx < totalQ)
+    {
+        const uint head = idx / pairsPerHead;
+        const uint pair = idx - head * pairsPerHead;
+        freq = pow(theta, -2.0f * (float)pair / (float)hd);
+        const float t = (float)pos * freq;
+        ct = cos(t);
+        st = sin(t);
+    }
+
+    const uint totalKV = nKV * pairsPerHead;
+
+    // ---- queries ---------------------------------------------------------
+    if (idx < totalQ)
+    {
+        const uint head = idx / pairsPerHead;
+        const uint pair = idx - head * pairsPerHead;
+        const uint base = head * hd + pair * 2;
+        const float e0 = AsF(RdBank(bank, qSrc + base));
+        const float e1 = AsF(RdBank(bank, qSrc + base + 1));
+        WrBank(obank, qDst + base,     AsU(e0 * ct - e1 * st));
+        WrBank(obank, qDst + base + 1, AsU(e0 * st + e1 * ct));
+    }
+
+    // ---- keys ------------------------------------------------------------
+    if (idx < totalKV)
+    {
+        const uint h    = idx / pairsPerHead;
+        const uint pair = idx - h * pairsPerHead;
+
+        // TWO different offsets, and conflating them silently corrupts the
+        // cache for every head except the first:
+        //
+        //   base    -- where this head lives inside the QKV activation bank,
+        //              which is packed as [head][channel].
+        //   inHead  -- the channel offset INSIDE one cache slot, which is
+        //              laid out as [kvHead][seq][channel].
+        //
+        // Writing the cache at `kSlot + base` put heads 1 and 2 at
+        // kvHead*maxSeq*hd + kvHead*hd, i.e. past the end of their own slot and
+        // into the gap before the next head. The attention pass then read an
+        // unwritten slot and the output was wrong for 2 of every 3 heads.
+        const uint base   = h * hd + pair * 2;
+        const uint inHead = pair * 2;
+
+        const float e0 = AsF(RdBank(bank, kSrc + base));
+        const float e1 = AsF(RdBank(bank, kSrc + base + 1));
+        const float r0 =  e0 * ct - e1 * st;
+        const float r1 =  e0 * st + e1 * ct;
+
+        WrBank(obank, kDst + base,     AsU(r0));
+        WrBank(obank, kDst + base + 1, AsU(r1));
+
+        // Append rotated key and the raw value to the paged KV cache.
+        const uint kvLayerStride = maxSeq * nKV * hd;
+        const uint kSlot = kvOff + (h * maxSeq + pos) * hd;
+        const uint vSlot = kvOff + kvLayerStride + (h * maxSeq + pos) * hd;
+
+        O_KVU[kSlot + inHead]     = AsU(r0);
+        O_KVU[kSlot + inHead + 1] = AsU(r1);
+
+        O_KVU[vSlot + inHead]     = RdBank(bank, vSrc + base);
+        O_KVU[vSlot + inHead + 1] = RdBank(bank, vSrc + base + 1);
+    }
+}

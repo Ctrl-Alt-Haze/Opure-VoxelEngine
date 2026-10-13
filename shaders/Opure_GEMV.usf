@@ -1,0 +1,89 @@
+// ============================================================================
+//  Opure_GEMV.usf
+//  Matrix-vector product:  y[o] = sum_i W[o][inDim + i] * x[i]
+//
+//  DESIGN NOTES
+//  ------------
+//  * Weight layout is the natural safetensors layout, [out, in] row-major, so no
+//    transpose is needed at load time -- the file streams straight into VRAM.
+//  * One 256-thread group computes one output row. Within a 32-lane wave the
+//    lanes read CONSECUTIVE elements of the same weight row, so every load is
+//    fully coalesced; the reduction is a WaveActiveSum, which costs no shared
+//    memory and no intra-wave barrier.
+//  * Only the 8 per-wave scalars pass through groupshared memory, so the whole
+//    kernel needs a single group barrier.
+//  * Parallelism is outDim groups x 256 threads. For a 49152-wide LM head that
+//    is 12.6M resident threads, which is what saturates memory bandwidth during
+//    autoregressive decode. A one-wave-per-row design would only produce 1536
+//    warps and would be bandwidth-starved.
+//
+//  The row comes from SV_GroupID and SV_GroupIndex is only the lane offset.
+//  Using SV_GroupIndex for the row silently collapses the matrix onto its
+//  diagonal, because every thread in a group then computes a different row.
+//
+//  P[0] = activation source word offset
+//  P[1] = weight word offset
+//  P[2] = destination word offset
+//  P[3] = inDim
+//  P[4] = outDim
+//  P[5] = activation source bank (0=A, 1=B, 2=C)
+//  P[6] = destination bank (0=A, 1=B, 2=C); must differ from P[5]
+// ============================================================================
+#include "Opure_Common.hlsl"
+
+#define GEMV_THREADS 256
+#define GEMV_WAVES   (GEMV_THREADS / OPURE_WAVE_SIZE)
+
+groupshared float gs_part[GEMV_WAVES];
+groupshared float gs_row;
+
+[numthreads(GEMV_THREADS, 1, 1)]
+void GEMVMain(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+              uint3 grp : SV_GroupID)
+{
+    const uint xOff  = P[0];
+    const uint wOff  = P[1];
+    const uint yOff  = P[2];
+    const uint inDim = P[3];
+    const uint outDim = P[4];
+    const uint bank  = P[5];
+    const uint obank = P[6];
+
+    const uint o = grp.x;
+    if (o >= outDim)
+    {
+        return;
+    }
+
+    // This group's slice of the weight matrix: a contiguous run of inDim words.
+    const uint wRow = wOff + o * inDim;
+
+    float acc = 0.0f;
+    for (uint i = lg; i < inDim; i += GEMV_THREADS)
+    {
+        acc = mad(AsF(O_W[wRow + i]), AsF(RdBank(bank, xOff + i)), acc);
+    }
+
+    const float waveSum = WaveActiveSum(acc);
+
+    if ((lg & (OPURE_WAVE_SIZE - 1)) == 0)
+    {
+        gs_part[lg >> 5] = waveSum;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (lg == 0)
+    {
+        // Written out rather than looped: this DXC build mis-compiles dynamic
+        // indexing into a groupshared array inside an unrolled loop.
+        const float total = gs_part[0] + gs_part[1] + gs_part[2] + gs_part[3] +
+                            gs_part[4] + gs_part[5] + gs_part[6] + gs_part[7];
+        gs_row = total;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (lg == 0)
+    {
+        WrBank(obank, yOff + o, AsU(gs_row));
+    }
+}

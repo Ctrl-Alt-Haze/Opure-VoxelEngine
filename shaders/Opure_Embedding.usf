@@ -1,0 +1,36 @@
+// ============================================================================
+//  Opure_Embedding.usf
+//  Copies one token's embedding row out of the weight buffer into the
+//  activation buffer.
+//
+//  The element index MUST come from SV_DispatchThreadID. This kernel is
+//  dispatched ceil(d_model / 64) groups of 64 threads, so SV_GroupIndex -- the
+//  lane within a group -- runs 0..63 in EVERY group. Using it as the element
+//  index made all nine groups write the same 64 words and left the other 512 of
+//  576 holding whatever was in the buffer before: the residual stream was
+//  half real data and half uninitialised VRAM, which is what made the model's
+//  logits non-deterministic across runs.
+//
+//  P[0] = destination word offset
+//  P[1] = token id
+//  P[2] = d_model
+//  P[3] = destination bank (0=A, 1=B, 2=C)
+// ============================================================================
+#include "Opure_Common.hlsl"
+
+[numthreads(64, 1, 1)]
+void EmbeddingMain(uint3 tid : SV_DispatchThreadID)
+{
+    const uint dst   = P[0];
+    const uint token = P[1];
+    const uint d     = P[2];
+    const uint obank = P[3];
+
+    const uint rowBase = token * d;
+    const uint i = tid.x;
+
+    if (i < d)
+    {
+        WrBank(obank, dst + i, O_W[rowBase + i]);
+    }
+}

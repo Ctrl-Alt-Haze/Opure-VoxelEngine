@@ -1,0 +1,28 @@
+// ============================================================================
+//  Opure_Add.usf
+//  Residual accumulation: dst = a + b
+//
+//  P[0] = source A word offset
+//  P[1] = source B word offset
+//  P[2] = destination word offset
+//  P[3] = element count
+//  P[4] = source bank (0=A, 1=B, 2=C)
+//  P[5] = destination bank (0=A, 1=B, 2=C); must differ from P[4]
+// ============================================================================
+#include "Opure_Common.hlsl"
+
+[numthreads(256, 1, 1)]
+void AddMain(uint3 tid : SV_DispatchThreadID)
+{
+    const uint a     = P[0];
+    const uint b     = P[1];
+    const uint dst   = P[2];
+    const uint n     = P[3];
+    const uint bank  = P[4];
+    const uint obank = P[5];
+
+    const uint i = tid.x;
+    if (i >= n) return;
+
+    WrBank(obank, dst + i, AsU(AsF(RdBank(bank, a + i)) + AsF(RdBank(bank, b + i))));
+}

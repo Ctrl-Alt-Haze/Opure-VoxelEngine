@@ -1,0 +1,86 @@
+// ============================================================================
+//  Opure_ArgMax.usf
+//  Greedy-decode reduction over the vocabulary logits.
+//
+//  Reading back the full [vocab] logit vector every token would cost a
+//  196 KB transfer and dominate decode latency. This reduces on the GPU and
+//  returns only the winning index and its value, so the CPU waits on 8 bytes.
+//
+//  A single 256-thread group strides the whole vocabulary, keeping a local best
+//  in registers; wave reductions combine lanes, and groupshared folds the eight
+//  wave winners together.
+//
+//  Output (misc buffer):
+//      [0] best logit value (float)
+//      [1] best token id    (uint)
+//
+//  P[0] = logit source word offset
+//  P[1] = vocabulary size
+//  P[2] = destination word offset in the KV buffer's reserved tail
+//  P[3] = source bank holding the logits (0=A, 1=B, 2=C)
+//
+//  The two result words are written into the KV resource rather than an
+//  activation bank so this dispatch never writes a bank it is also reading.
+// ============================================================================
+#include "Opure_Common.hlsl"
+
+#define AM_THREADS 256
+#define AM_WAVES   (AM_THREADS / OPURE_WAVE_SIZE)
+
+groupshared float gs_val[AM_WAVES];
+groupshared uint  gs_idx[AM_WAVES];
+
+[numthreads(AM_THREADS, 1, 1)]
+void ArgMaxMain(uint gid : SV_GroupIndex)
+{
+    const uint src = P[0];
+    const uint n   = P[1];
+    const uint dst = P[2];
+    const uint bank = P[3];
+
+    float bestVal = -3.402823466e+38f;
+    uint  bestIdx = 0u;
+
+    for (uint i = gid; i < n; i += AM_THREADS)
+    {
+        const float v = AsF(RdBank(bank, src + i));
+        if (v > bestVal)
+        {
+            bestVal = v;
+            bestIdx = i;
+        }
+    }
+
+    // Two SIMD reductions rather than packing (value,index) into a float2:
+    // wave-max the logit, then wave-min the candidate index among the lanes
+    // that hold it. This avoids mixing uint into a float2 constructor, which
+    // this compiler rejects as an implicit vector truncation.
+    const float wmax = WaveActiveMax(bestVal);
+    const uint  cand = (bestVal == wmax) ? bestIdx : 0xFFFFFFFFu;
+    const uint  wmin = WaveActiveMin(cand);
+
+    if ((gid & (OPURE_WAVE_SIZE - 1)) == 0)
+    {
+        gs_val[gid >> 5] = wmax;
+        gs_idx[gid >> 5] = wmin;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (gid == 0)
+    {
+        // Written out rather than looped: this DXC build mis-compiles dynamic
+        // indexing into a groupshared array inside an unrolled loop.
+        float v = gs_val[0]; uint k = gs_idx[0];
+
+        if (gs_val[1] > v) { v = gs_val[1]; k = gs_idx[1]; }
+        if (gs_val[2] > v) { v = gs_val[2]; k = gs_idx[2]; }
+        if (gs_val[3] > v) { v = gs_val[3]; k = gs_idx[3]; }
+        if (gs_val[4] > v) { v = gs_val[4]; k = gs_idx[4]; }
+        if (gs_val[5] > v) { v = gs_val[5]; k = gs_idx[5]; }
+        if (gs_val[6] > v) { v = gs_val[6]; k = gs_idx[6]; }
+        if (gs_val[7] > v) { v = gs_val[7]; k = gs_idx[7]; }
+
+        O_KVU[dst + 0] = AsU(v);
+        O_KVU[dst + 1] = k;
+    }
+}

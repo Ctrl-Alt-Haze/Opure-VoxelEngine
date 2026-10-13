@@ -1,0 +1,48 @@
+// ============================================================================
+//  Opure_Debug.usf
+//  Minimal write probe: binds nothing but one UAV and writes a known constant.
+//
+//  This deliberately reads NO root constants and NO SRVs. If this shader's
+//  output is visible, then dispatch, the pipeline state and UAV root-descriptor
+//  binding are all sound and any failure elsewhere is a root-constant problem.
+//  If its output is invisible, the fault is in the dispatch path itself.
+// ============================================================================
+#include "Opure_Common.hlsl"
+
+[numthreads(64, 1, 1)]
+void DebugMain(uint3 gid : SV_DispatchThreadID)
+{
+    if (gid.x < 64u)
+    {
+        // Deliberately not derived from any input: the value encodes the lane id
+        // so a partial/garbled write is distinguishable from a correct one.
+        O_AU[gid.x] = AsU(1000.0f + (float)gid.x);
+    }
+}
+
+// Parameter-block probe. Copies P[0..3] through to the destination word range
+// selected by P[4], as RAW 32-BIT WORDS -- no float reinterpretation anywhere,
+// so a mismatch can only mean the slot address or the buffer contents are
+// wrong, never a bit-cast artefact.
+//
+// P[4] also drives the destination index, which lets the caller place two
+// dispatches side by side without them overwriting each other.
+[numthreads(1, 1, 1)]
+void DebugRootConstMain(uint3 gid : SV_DispatchThreadID)
+{
+    const uint dst = P[4];
+    O_AU[dst + 0] = P[0];
+    O_AU[dst + 1] = P[1];
+    O_AU[dst + 2] = P[2];
+    O_AU[dst + 3] = P[3];
+}
+
+// SRV probe: copies words[0] (t0) and kv[0] (t3) into bank A, and bank B's
+// word 0 into bank A at index 3. Reads and writes touch distinct resources.
+[numthreads(1, 1, 1)]
+void DebugSrvMain(uint3 gid : SV_DispatchThreadID)
+{
+    O_AU[0] = O_W[0];
+    O_AU[1] = O_KV[0];
+    O_AU[2] = O_B[0];
+}
