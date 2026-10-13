@@ -41,6 +41,19 @@ enum class Id : uint32_t
     Attention192,
     Attention224,
     Attention256,
+
+    // Speculative decode (batched verification) entry points. Same head_dim
+    // specializations as attention, but with 12 root parameters for draft
+    // metadata. See Opure_SpeculativeDecode.usf.
+    SpecVerify32,
+    SpecVerify64,
+    SpecVerify96,
+    SpecVerify128,
+    SpecVerify160,
+    SpecVerify192,
+    SpecVerify224,
+    SpecVerify256,
+
     SwiGLU,
     Add,
     AddRes,      // cross-bank residual add (residual lives in bank C)
@@ -90,6 +103,22 @@ public:
     [[nodiscard]] static constexpr bool HasAttentionFor(uint32_t headDim)
     {
         return headDim != 0 && headDim <= 256 && (headDim % 32u) == 0;
+    }
+
+    [[nodiscard]] static Id SpecVerifyFor(uint32_t headDim)
+    {
+        switch (headDim)
+        {
+        case 32:  return Id::SpecVerify32;
+        case 64:  return Id::SpecVerify64;
+        case 96:  return Id::SpecVerify96;
+        case 128: return Id::SpecVerify128;
+        case 160: return Id::SpecVerify160;
+        case 192: return Id::SpecVerify192;
+        case 224: return Id::SpecVerify224;
+        case 256: return Id::SpecVerify256;
+        default:  return Id::Count;
+        }
     }
 
 private:

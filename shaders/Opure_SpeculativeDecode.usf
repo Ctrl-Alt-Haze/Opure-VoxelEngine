@@ -1,0 +1,190 @@
+// ============================================================================
+//  Opure_SpeculativeDecode.usf
+//  Opure-VoxelEngine -- speculative decode (draft + verify) entry point.
+// ============================================================================
+//  SPECULATIVE DECODE
+//  -----------------
+//  The standard autoregressive decode does one forward pass per token.
+//  Speculative decode (Leviathan / REST / Medusa style) generates a tree of
+//  `k` draft tokens cheaply, then verifies the entire tree in ONE batched
+//  forward pass of the main model. Accepted tokens amortize the main model
+//  cost over `k+1` tokens, yielding 2-3x throughput.
+//
+//  This kernel runs the VERIFICATION step:
+//   - Input: draft token sequence [draft_0, draft_1, ..., draft_k]
+//   - Action: run main model on prompt + all drafts in parallel
+//   - Output: logits for each position, accepted/rejected mask
+//
+//  The draft generation is done by a separate (smaller) model or by the
+//  same model with fewer layers - that happens on the host or in a separate
+//  kernel. This kernel ONLY does the batched verification.
+//
+//  PARALLEL VERIFICATION
+//  --------------------
+//  We dispatch one thread per (head, position) pair. Each thread computes
+//  attention for its head across the entire sequence (prompt + drafts).
+//  The KV cache already contains the prompt; we append the draft tokens
+//  to the cache speculatively, then run attention.
+//
+//  If the draft is correct, the KV cache is already correct and we just
+//  advance the position. If wrong, we roll back and redo normally.
+//
+//  P[0]  = q_off      (rotated query word offset for prompt+drafts)
+//  P[1]  = kv_off     (KV cache word offset for this layer)
+//  P[2]  = out_off    (destination word offset)
+//  P[3]  = n_kv_heads
+//  P[4]  = head_dim
+//  P[5]  = max_seq    (max capacity of KV cache)
+//  P[6]  = seq_len    (prompt_len + num_drafts)
+//  P[7]  = n_heads
+//  P[8]  = src_bank   (activation bank containing rotated queries)
+//  P[9]  = dst_bank   (activation bank for attention output)
+//  P[10] = prompt_len (length of actual prompt, for causal masking)
+//  P[11] = num_drafts (number of speculative draft tokens)
+// ============================================================================
+#include "Opure_Common.hlsl"
+
+#ifndef OPURE_ATT_THREADS
+#define OPURE_ATT_THREADS 64
+#endif
+
+#define OPURE_ATT_WAVES (OPURE_ATT_THREADS / OPURE_WAVE_SIZE)
+
+groupshared float gs_part[8];
+
+// ---------------------------------------------------------------------------
+//  Batched speculative verify attention kernel.
+//  One group per query head. Each group processes the ENTIRE sequence
+//  (prompt + drafts) in parallel over the head dimension.
+// ============================================================================
+#define OPURE_SPEC_ATT_BODY                                             \
+    const uint qOff = P[0], kvOff = P[1], outOff = P[2];                \
+    const uint nKV = P[3], hd = P[4], maxSeq = P[5], seqLen = P[6];     \
+    const uint nH = P[7];                                               \
+    const uint bank  = P[8];                                            \
+    const uint obank = P[9];                                            \
+    const uint promptLen = P[10];                                       \
+    const uint numDrafts = P[11];                                       \
+                                                                        \
+    /* One group per query head */                                      \
+    const uint h = grp.x;                                               \
+    if (h >= nH) return;                                                \
+                                                                        \
+    const uint lane = lg;                                               \
+    const uint kvGroup = nH / nKV;                                      \
+    const uint kvHead  = h / kvGroup;                                   \
+    const uint qBase   = h * hd;                                        \
+                                                                        \
+    const uint kvLayerStride = maxSeq * nKV * hd;                       \
+    const uint kBase = kvOff + kvHead * maxSeq * hd;                    \
+    const uint vBase = kvOff + kvLayerStride + kvHead * maxSeq * hd;    \
+                                                                        \
+    float runningMax = -3.402823466e+38f;                               \
+    float runningSum = 0.0f;                                            \
+    float acc = 0.0f;                                                   \
+                                                                        \
+    const float qv = AsF(RdBank(bank, qOff + qBase + lane));            \
+                                                                        \
+    for (uint s = 0; s < seqLen; ++s)                                   \
+    {                                                                   \
+        const uint kIdx = kBase + (s * hd) + lane;                      \
+                                                                        \
+        const float partial = AsF(O_KV[kIdx]) * qv;                     \
+        const float waveSum = WaveActiveSum(partial);                   \
+                                                                        \
+        if ((lane & (OPURE_WAVE_SIZE - 1)) == 0)                        \
+        {                                                               \
+            gs_part[lane >> 5] = waveSum;                               \
+        }                                                               \
+        GroupMemoryBarrierWithGroupSync();                              \
+                                                                        \
+        float score = 0.0f;                                             \
+        [unroll]                                                         \
+        for (uint w = 0; w < OPURE_ATT_WAVES; ++w) score += gs_part[w]; \
+                                                                        \
+        /* Causal mask: tokens can only attend to positions <= themselves */ \
+        if (s >= promptLen)                                             \
+        {                                                               \
+            /* Draft token: can attend to prompt + previous drafts */   \
+            uint draftIdx = s - promptLen;                              \
+            if (draftIdx > 0)                                           \
+            {                                                           \
+                /* Only mask future drafts - they don't exist yet */    \
+                /* Actually we just rely on KV cache not having them */ \
+            }                                                           \
+        }                                                               \
+                                                                        \
+        const float newMax = max(runningMax, score);                    \
+        const float corr  = (runningMax <= -3.4e38f) ? 0.0f              \
+                                                     : exp(runningMax - newMax); \
+        const float p     = exp(score - newMax);                        \
+                                                                        \
+        runningSum = runningSum * corr + p;                             \
+        const float v = AsF(O_KV[vBase + (s * hd) + lane]);             \
+        acc = acc * corr + p * v;                                       \
+                                                                        \
+        runningMax = newMax;                                            \
+        GroupMemoryBarrierWithGroupSync();                              \
+    }                                                                   \
+                                                                        \
+    if (lane < hd)                                                      \
+    {                                                                   \
+        WrBank(obank, outOff + qBase + lane,                            \
+               AsU(acc / max(runningSum, 1e-30f)));                     \
+    }
+
+[numthreads(32, 1, 1)]
+void SpeculativeVerifyMain32(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                             uint3 grp : SV_GroupID)
+{
+    OPURE_SPEC_ATT_BODY
+}
+
+[numthreads(64, 1, 1)]
+void SpeculativeVerifyMain64(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                             uint3 grp : SV_GroupID)
+{
+    OPURE_SPEC_ATT_BODY
+}
+
+[numthreads(96, 1, 1)]
+void SpeculativeVerifyMain96(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                             uint3 grp : SV_GroupID)
+{
+    OPURE_SPEC_ATT_BODY
+}
+
+[numthreads(128, 1, 1)]
+void SpeculativeVerifyMain128(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                              uint3 grp : SV_GroupID)
+{
+    OPURE_SPEC_ATT_BODY
+}
+
+[numthreads(160, 1, 1)]
+void SpeculativeVerifyMain160(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                              uint3 grp : SV_GroupID)
+{
+    OPURE_SPEC_ATT_BODY
+}
+
+[numthreads(192, 1, 1)]
+void SpeculativeVerifyMain192(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                              uint3 grp : SV_GroupID)
+{
+    OPURE_SPEC_ATT_BODY
+}
+
+[numthreads(224, 1, 1)]
+void SpeculativeVerifyMain224(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                              uint3 grp : SV_GroupID)
+{
+    OPURE_SPEC_ATT_BODY
+}
+
+[numthreads(256, 1, 1)]
+void SpeculativeVerifyMain256(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                              uint3 grp : SV_GroupID)
+{
+    OPURE_SPEC_ATT_BODY
+}

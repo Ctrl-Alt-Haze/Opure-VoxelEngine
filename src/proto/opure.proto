@@ -1,0 +1,164 @@
+syntax = "proto3";
+
+package opure;
+
+// ---------------------------------------------------------------------------
+//  Opure gRPC service — inference, model management, health.
+//  UE5 plugin, TUI, and any other client speak this.
+// ---------------------------------------------------------------------------
+service Opure {
+  // Streaming generation: client sends prompt, server streams tokens.
+  rpc Generate(GenerateRequest) returns (stream GenerateResponse);
+
+  // Single embedding (for RAG, classification, etc.)
+  rpc Embed(EmbedRequest) returns (EmbedResponse);
+
+  // Load / unload / list models known to the server.
+  rpc LoadModel(LoadModelRequest) returns (LoadModelResponse);
+  rpc UnloadModel(UnloadModelRequest) returns (UnloadModelResponse);
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // Health + introspection.
+  rpc Health(HealthRequest) returns (HealthResponse);
+  rpc Metrics(MetricsRequest) returns (stream MetricsSnapshot);
+}
+
+// ---------------------------------------------------------------------------
+//  Messages
+// ---------------------------------------------------------------------------
+message GenerateRequest {
+  string model_id = 1;           // e.g. "SmolLM-135M" or path
+  string prompt = 2;
+  GenerationConfig config = 3;
+}
+
+message GenerationConfig {
+  uint32 max_new_tokens = 1;
+  float temperature = 3;
+  float top_p = 4;
+  uint32 top_k = 5;
+  float repetition_penalty = 6;
+  // If true, return logprobs for each token (costly).
+  bool return_logprobs = 7;
+  // Speculative decoding: number of draft tokens per verify step.
+  // 0 = disabled (default).
+  uint32 draft_tokens = 8;
+}
+
+message GenerateResponse {
+  // One token per response when streaming.
+  string token = 1;
+  uint32 token_id = 2;
+  // Cumulative tokens generated so far.
+  uint32 generated = 3;
+  // Tokens/sec since first token.
+  float tokens_per_sec = 4;
+  // Per-token logprobs (only if requested).
+  repeated float logprobs = 5;
+  // True on the final chunk.
+  bool done = 6;
+  // If done=true, this is the stop reason.
+  StopReason stop_reason = 7;
+}
+
+enum StopReason {
+  STOP_REASON_UNSPECIFIED = 0;
+  STOP_REASON_EOS = 1;
+  STOP_REASON_MAX_TOKENS = 2;
+  STOP_REASON_STOP_STRING = 3;
+  STOP_REASON_CANCELLED = 4;
+}
+
+message EmbedRequest {
+  string model_id = 1;
+  repeated string texts = 2;
+  bool normalize = 3;
+}
+
+message EmbedResponse {
+  repeated Embedding embeddings = 1;
+}
+
+message Embedding {
+  repeated float values = 1;
+}
+
+message LoadModelRequest {
+  string model_id = 1;           // user-facing name
+  string path = 2;               // directory containing config.json + model.safetensors
+  // If true, this becomes the default model for requests without model_id.
+  bool make_default = 3;
+}
+
+message LoadModelResponse {
+  bool ok = 1;
+  string error = 2;
+  ModelInfo info = 3;
+}
+
+message UnloadModelRequest {
+  string model_id = 1;
+}
+
+message UnloadModelResponse {
+  bool ok = 1;
+  string error = 2;
+}
+
+message ListModelsRequest {}
+message ListModelsResponse {
+  repeated ModelInfo models = 1;
+}
+
+message ModelInfo {
+  string model_id = 1;
+  string path = 2;
+  string architecture = 3;
+  uint32 hidden_size = 4;
+  uint32 num_layers = 5;
+  uint32 num_heads = 6;
+  uint32 num_kv_heads = 7;
+  uint32 head_dim = 8;
+  uint32 vocab_size = 9;
+  uint32 max_position_embeddings = 10;
+  bool loaded = 11;
+  bool is_default = 12;
+  // VRAM usage in bytes.
+  uint64 vram_bytes = 13;
+}
+
+message HealthRequest {}
+message HealthResponse {
+  bool ok = 1;
+  string version = 2;
+  // GPU info
+  string gpu_name = 3;
+  uint64 vram_total_bytes = 4;
+  uint64 vram_used_bytes = 5;
+  // Loaded models
+  repeated ModelInfo loaded_models = 6;
+}
+
+message MetricsRequest {
+  // If set, only emit for this model.
+  string model_id = 1;
+  // Interval in ms between snapshots. 0 = single snapshot.
+  uint32 interval_ms = 2;
+}
+
+message MetricsSnapshot {
+  uint64 timestamp_ms = 1;
+  string model_id = 2;
+  // Per-layer timing (ms)
+  repeated float layer_times_ms = 3;
+  // KV cache occupancy (0..1)
+  float kv_occupancy = 4;
+  // Logit entropy (nats)
+  float logit_entropy = 5;
+  // Current tokens/sec
+  float tokens_per_sec = 6;
+  // Memory pressure: allocated / limit
+  float memory_pressure = 7;
+  // Speculative acceptance rate (0..1), -1 if disabled
+  float speculative_acceptance = 8;
+}

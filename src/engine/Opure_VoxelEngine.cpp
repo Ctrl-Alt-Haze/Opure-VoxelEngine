@@ -4,6 +4,7 @@
 // ============================================================================
 #include "engine/Opure_VoxelEngine.h"
 
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -550,6 +551,40 @@ void VoxelEngine::PoisonBanks(float fill)
 }
 
 // ---------------------------------------------------------------------------
+//  Self-monitoring implementation
+// ---------------------------------------------------------------------------
+VoxelEngine::MetricsSnapshot VoxelEngine::SnapshotMetrics()
+{
+    MetricsSnapshot snap;
+    snap.timestampMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+
+    const auto& plan = graph_.Plan();
+    const auto& cfg = graph_.Config();
+
+    snap.kvOccupancy = cfg.maxPositions > 0
+        ? static_cast<float>(seqLen_) / cfg.maxPositions
+        : 0.0f;
+
+    snap.logitEntropy = lastLogitEntropy_;
+    snap.logitNorm = lastLogitNorm_;
+    snap.maxAttnScore = lastMaxAttnScore_;
+
+    snap.tokensPerSec = lastTokenTimeMs_ > 0
+        ? 1000.0f / lastTokenTimeMs_
+        : 0.0f;
+
+    snap.memoryPressure = plan.availableBytes > 0
+        ? static_cast<float>(plan.totalBytes) / plan.availableBytes
+        : 0.0f;
+
+    snap.speculativeAcceptance = -1.0f;  // not implemented yet
+    snap.layerTimesMs.clear();  // would need per-layer timing hooks
+
+    return snap;
+}
+
+// ---------------------------------------------------------------------------
 //  Prefill
 // ---------------------------------------------------------------------------
 //  Records every prompt token. The tokens are split into chunks so that no
@@ -694,7 +729,12 @@ GenerateResult VoxelEngine::Generate(const std::vector<uint32_t>& tokens,
             break;
         }
         if (seqLen_ + 1 >= maxPos) { break; }
+        uint64_t stepStart = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
         next = DecodeStep(next, seqLen_);
+        uint64_t stepEnd = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        lastTokenTimeMs_ = static_cast<uint64_t>((stepEnd - stepStart) / 1000.0f);
     }
     return r;
 }

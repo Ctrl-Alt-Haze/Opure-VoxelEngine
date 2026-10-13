@@ -72,6 +72,16 @@ $manifest = [ordered]@{
         @{ Entry = 'AttentionMain224'; Defines = @('OPURE_ATT_THREADS=224') },
         @{ Entry = 'AttentionMain256'; Defines = @('OPURE_ATT_THREADS=256') }
     )
+    'Opure_SpeculativeDecode' = @(
+        @{ Entry = 'SpeculativeVerifyMain32';  Defines = @('OPURE_ATT_THREADS=32')  },
+        @{ Entry = 'SpeculativeVerifyMain64';  Defines = @('OPURE_ATT_THREADS=64')  },
+        @{ Entry = 'SpeculativeVerifyMain96';  Defines = @('OPURE_ATT_THREADS=96')  },
+        @{ Entry = 'SpeculativeVerifyMain128'; Defines = @('OPURE_ATT_THREADS=128') },
+        @{ Entry = 'SpeculativeVerifyMain160'; Defines = @('OPURE_ATT_THREADS=160') },
+        @{ Entry = 'SpeculativeVerifyMain192'; Defines = @('OPURE_ATT_THREADS=192') },
+        @{ Entry = 'SpeculativeVerifyMain224'; Defines = @('OPURE_ATT_THREADS=224') },
+        @{ Entry = 'SpeculativeVerifyMain256'; Defines = @('OPURE_ATT_THREADS=256') }
+    )
     'Opure_SwiGLU'                = @('SwiGLUMain')
     'Opure_Add'                   = @('AddMain')
     'Opure_AddRes'                = @('AddResMain')

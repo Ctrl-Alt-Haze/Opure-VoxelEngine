@@ -27,7 +27,7 @@ void Library::Initialize(dx12::Device& dev)
     static_assert(static_cast<uint32_t>(Id::WeightCommit) + 1u ==
                   static_cast<uint32_t>(kShaderCount),
                   "kShaderCount does not match the number of pipelines in Id");
-    OPURE_ASSERT(kShaderCount == 22);
+    OPURE_ASSERT(kShaderCount == 30);
 
     // The attention entry points are the one place where a mapping mistake is
     // invisible: a head_dim-64 model dispatched onto the 256-thread pipeline
@@ -37,6 +37,9 @@ void Library::Initialize(dx12::Device& dev)
     static_assert(static_cast<uint32_t>(Id::Attention256) ==
                   static_cast<uint32_t>(Id::Attention32) + 7u,
                   "attention entry points must be contiguous from 32 to 256");
+    static_assert(static_cast<uint32_t>(Id::SpecVerify256) ==
+                  static_cast<uint32_t>(Id::SpecVerify32) + 7u,
+                  "speculative verify entry points must be contiguous from 32 to 256");
 
     // Map our Id enum onto the generated table order.
     struct Entry { Id id; const ShaderBlob* blob; const char* name; };
@@ -57,6 +60,14 @@ void Library::Initialize(dx12::Device& dev)
         { Id::Attention192, &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain192)], "Attention192" },
         { Id::Attention224, &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain224)], "Attention224" },
         { Id::Attention256, &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain256)], "Attention256" },
+        { Id::SpecVerify32,  &kShaderTable[static_cast<size_t>(ShaderId::SpeculativeVerifyMain32)],  "SpecVerify32"  },
+        { Id::SpecVerify64,  &kShaderTable[static_cast<size_t>(ShaderId::SpeculativeVerifyMain64)],  "SpecVerify64"  },
+        { Id::SpecVerify96,  &kShaderTable[static_cast<size_t>(ShaderId::SpeculativeVerifyMain96)],  "SpecVerify96"  },
+        { Id::SpecVerify128, &kShaderTable[static_cast<size_t>(ShaderId::SpeculativeVerifyMain128)], "SpecVerify128" },
+        { Id::SpecVerify160, &kShaderTable[static_cast<size_t>(ShaderId::SpeculativeVerifyMain160)], "SpecVerify160" },
+        { Id::SpecVerify192, &kShaderTable[static_cast<size_t>(ShaderId::SpeculativeVerifyMain192)], "SpecVerify192" },
+        { Id::SpecVerify224, &kShaderTable[static_cast<size_t>(ShaderId::SpeculativeVerifyMain224)], "SpecVerify224" },
+        { Id::SpecVerify256, &kShaderTable[static_cast<size_t>(ShaderId::SpeculativeVerifyMain256)], "SpecVerify256" },
         { Id::SwiGLU,       &kShaderTable[static_cast<size_t>(ShaderId::SwiGLUMain)],       "SwiGLU"       },
         { Id::Add,          &kShaderTable[static_cast<size_t>(ShaderId::AddMain)],          "Add"          },
         { Id::AddRes,       &kShaderTable[static_cast<size_t>(ShaderId::AddResMain)],       "AddRes"       },

@@ -145,3 +145,19 @@ if(_opure_shader_count LESS 10)
 else()
     add_dependencies(opure_harness opure_shaders)
 endif()
+
+# ---------------------------------------------------------------------------
+#  Opure TUI executable (interactive chat) -- links engine directly
+# ---------------------------------------------------------------------------
+add_executable(opure_chat
+    src/app/Opure_Chat.cpp
+)
+target_link_libraries(opure_chat PRIVATE OpureVoxelEngine opure_warnings)
+
+# ---------------------------------------------------------------------------
+#  Opure Server executable -- simple HTTP for UE5 plugin
+# ---------------------------------------------------------------------------
+add_executable(opure_server
+    src/app/Opure_Server.cpp
+)
+target_link_libraries(opure_server PRIVATE OpureVoxelEngine opure_warnings)

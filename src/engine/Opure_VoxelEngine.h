@@ -213,6 +213,29 @@ public:
     // the harness can prove every word the graph reads was written by it.
     void PoisonBanks(float fill);
 
+    // ---------------------------------------------------------------------------
+    //  Self-monitoring / observability
+    // ---------------------------------------------------------------------------
+    struct MetricsSnapshot
+    {
+        uint64_t timestampMs = 0;
+        std::vector<float> layerTimesMs;
+        float kvOccupancy = 0.0f;
+        float logitEntropy = 0.0f;
+        float tokensPerSec = 0.0f;
+        float memoryPressure = 0.0f;
+        float speculativeAcceptance = -1.0f;
+        float logitNorm = 0.0f;
+        float maxAttnScore = 0.0f;
+    };
+
+    // Takes a snapshot of runtime metrics after the last token generation.
+    // Call after each DecodeStep to track model behavior.
+    MetricsSnapshot SnapshotMetrics();
+
+    // Current sequence length (tokens written to KV cache).
+    [[nodiscard]] uint32_t CurrentPosition() const { return seqLen_; }
+
 private:
     // Borrowed from the caller; see Initialize().
     dx12::Device*          dev_   = nullptr;
@@ -225,8 +248,16 @@ private:
     EngineOptions          opts_{};
     bool                   ready_ = false;
 
+    // Self-monitoring state (friend MetricsCollector for access).
+    uint64_t               lastTokenTimeMs_ = 0;
+    float                  lastLogitEntropy_ = 0.0f;
+    float                  lastLogitNorm_ = 0.0f;
+    float                  lastMaxAttnScore_ = 0.0f;
+
     // KV cache bookkeeping. seqLen_ counts tokens written so far.
     uint32_t               seqLen_ = 0;
+
+    friend class MetricsCollector;
     uint32_t               kvLayerWords_ = 0;   // words of KV per layer
 
     // Scratch offsets inside ONE activation bank, in words.
