@@ -62,7 +62,16 @@ $manifest = [ordered]@{
     'Opure_RoPE'                  = @('RoPEMain')
     'Opure_GEMV'                  = @('GEMVMain')
     'Opure_GEMV_Quant'            = @('GEMVQuantMain')
-    'Opure_FlashAttention_Decode' = @('AttentionMain', 'AttentionMain128')
+    'Opure_FlashAttention_Decode' = @(
+        @{ Entry = 'AttentionMain32';  Defines = @('OPURE_ATT_THREADS=32')  },
+        @{ Entry = 'AttentionMain64';  Defines = @('OPURE_ATT_THREADS=64')  },
+        @{ Entry = 'AttentionMain96';  Defines = @('OPURE_ATT_THREADS=96')  },
+        @{ Entry = 'AttentionMain128'; Defines = @('OPURE_ATT_THREADS=128') },
+        @{ Entry = 'AttentionMain160'; Defines = @('OPURE_ATT_THREADS=160') },
+        @{ Entry = 'AttentionMain192'; Defines = @('OPURE_ATT_THREADS=192') },
+        @{ Entry = 'AttentionMain224'; Defines = @('OPURE_ATT_THREADS=224') },
+        @{ Entry = 'AttentionMain256'; Defines = @('OPURE_ATT_THREADS=256') }
+    )
     'Opure_SwiGLU'                = @('SwiGLUMain')
     'Opure_Add'                   = @('AddMain')
     'Opure_AddRes'                = @('AddResMain')
@@ -89,14 +98,29 @@ foreach ($name in $manifest.Keys) {
     }
 
     foreach ($entry in $manifest[$name]) {
-        $symbol  = $entry
-        $dxil    = Join-Path $tmp "$entry.dxil"
+        # A manifest entry is either a bare entry-point name, or a hashtable of
+        # @{ Entry = 'Name'; Defines = @('K=V', ...) }. The hashtable form exists
+        # for entry points that are specialised by a preprocessor define -- the
+        # attention kernel compiles once per supported head_dim, and hand-writing
+        # eight near-identical bodies in the .usf was how the 64 and 128 variants
+        # drifted apart in the first place.
+        $defines = @()
+        if ($entry -is [hashtable]) {
+            $symbol  = $entry.Entry
+            $defines = @($entry.Defines)
+        }
+        else {
+            $symbol  = [string]$entry
+        }
+        $dxil = Join-Path $tmp "$symbol.dxil"
 
         # -enable-16bit-types : native fp16 math for the packed-precision paths.
         # -O3                 : decode is latency-critical; this is not optional.
         # -I                  : shaders include Opure_Common.hlsl.
-        $args = @('-T', $Target, '-E', $entry, '-enable-16bit-types', '-O3',
-                  '-I', $ShaderDir, '-Fo', $dxil, $src)
+        $args = @('-T', $Target, '-E', $symbol, '-enable-16bit-types', '-O3',
+                  '-I', $ShaderDir)
+        foreach ($d in $defines) { $args += @('-D', $d) }
+        $args += @('-Fo', $dxil, $src)
 
         # Windows PowerShell surfaces native stderr as error records, which
         # ErrorActionPreference='Stop' would turn into a false failure on a
@@ -113,14 +137,14 @@ foreach ($name in $manifest.Keys) {
         }
 
         if ($exitCode -ne 0 -or -not (Test-Path $dxil)) {
-            Write-Host ("  [FAIL]  {0}.usf::{1}" -f $name, $entry) -ForegroundColor Red
+            Write-Host ("  [FAIL]  {0}.usf::{1}" -f $name, $symbol) -ForegroundColor Red
             $failures++
             continue
         }
 
         $bytes = [System.IO.File]::ReadAllBytes($dxil)
         $blobs[$symbol] = $bytes
-        Write-Host ("  [ok]    {0,-34} {1,7} bytes  <- {2}.usf::{3}" -f $symbol, $bytes.Length, $name, $entry)
+        Write-Host ("  [ok]    {0,-34} {1,7} bytes  <- {2}.usf::{3}" -f $symbol, $bytes.Length, $name, $symbol)
     }
 }
 

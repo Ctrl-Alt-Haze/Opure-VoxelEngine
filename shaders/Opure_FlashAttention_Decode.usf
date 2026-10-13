@@ -14,6 +14,17 @@
 //  Two entry points are compiled from this file, ATT_THREADS = headDim, so that
 //  head_dim 64 and head_dim 128 models both get a fully occupied group.
 //
+//  GENERALISATION
+//  -------------
+//  head_dim is a property of the checkpoint, not of this engine. Restricting it
+//  to 64 and 128 excluded most of the model zoo for no reason: Phi-3 uses 96 and
+//  Gemma 2 uses 256, and both are ordinary llama-family decoders. The kernel is
+//  now compiled for every head_dim that is a multiple of the wave size, because
+//  the mapping below puts one head-dim channel on one lane -- which is what makes
+//  the QK reduction a plain WaveActiveSum with no cross-lane fixup. A head_dim
+//  that is NOT a multiple of 32 would leave a partial wave, and is rejected at
+//  model-load time rather than silently mis-reduced.
+//
 //  P[0] = rotated-query word offset
 //  P[1] = KV cache word offset for this layer
 //  P[2] = destination word offset
@@ -31,136 +42,139 @@
 #define OPURE_ATT_THREADS 64
 #endif
 
-#define ATT_WAVES (OPURE_ATT_THREADS / OPURE_WAVE_SIZE)
+// One group covers exactly one head's channel vector, so the group width IS
+// head_dim. Number of 32-lane waves the QK reduction has to combine.
+#define OPURE_ATT_WAVES (OPURE_ATT_THREADS / OPURE_WAVE_SIZE)
 
-// Sized for the widest entry point (128 threads = 4 waves); the 64-thread
-// entry point only uses the first two slots.
-groupshared float gs_part[4];
+// Largest entry point compiled below (256 threads = 8 waves). Every smaller
+// entry point uses only the first OPURE_ATT_WAVES slots.
+groupshared float gs_part[8];
 
-[numthreads(OPURE_ATT_THREADS, 1, 1)]
-void AttentionMain(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
-                   uint3 grp : SV_GroupID)
+// ---------------------------------------------------------------------------
+//  The body, shared by every entry point. Included twice with a different
+//  OPURE_ATT_THREADS rather than duplicated, because a copy per head_dim is a
+//  copy per thing to keep in sync.
+// ---------------------------------------------------------------------------
+#define OPURE_ATT_BODY                                             \
+    const uint qOff = P[0], kvOff = P[1], outOff = P[2];            \
+    const uint nKV = P[3], hd = P[4], maxSeq = P[5], seqLen = P[6]; \
+    const uint nH = P[7];                                           \
+    const uint bank  = P[8];                                        \
+    const uint obank = P[9];                                        \
+                                                                     \
+    /* One group per query head: the HEAD is the group ID, while `lg` is */ \
+    /* the lane that owns one channel of the head dimension.            */ \
+    const uint h = grp.x;                                            \
+    if (h >= nH) return;                                             \
+                                                                     \
+    const uint lane = lg;                                            \
+    const uint kvGroup = nH / nKV;                 /* queries per KV head */ \
+    const uint kvHead  = h / kvGroup;                                   \
+    const uint qBase   = h * hd;                                      \
+                                                                     \
+    const uint kvLayerStride = maxSeq * nKV * hd;                      \
+    const uint kBase = kvOff + kvHead * maxSeq * hd;                  \
+    const uint vBase = kvOff + kvLayerStride + kvHead * maxSeq * hd;   \
+                                                                     \
+    float runningMax = -3.402823466e+38f;                             \
+    float runningSum = 0.0f;                                          \
+    float acc = 0.0f;   /* this thread's head-dim channel */           \
+                                                                     \
+    const float qv = AsF(RdBank(bank, qOff + qBase + lane));           \
+                                                                     \
+    for (uint s = 0; s < seqLen; ++s)                                  \
+    {                                                                 \
+        const uint kIdx = kBase + (s * hd) + lane;                     \
+                                                                         \
+        /* Partial QK^T for this channel, then a SIMD cross-lane */      \
+        /* reduction across each wave. */                                 \
+        const float partial = AsF(O_KV[kIdx]) * qv;                     \
+        const float waveSum = WaveActiveSum(partial);                   \
+                                                                         \
+        if ((lane & (OPURE_WAVE_SIZE - 1)) == 0)                       \
+        {                                                               \
+            gs_part[lane >> 5] = waveSum;                               \
+        }                                                               \
+        GroupMemoryBarrierWithGroupSync();                              \
+                                                                         \
+        /* Every lane redundantly recombines the wave scalars: one         */ \
+        /* shared-memory read per step, and no second barrier.             */ \
+        float score = 0.0f;                                             \
+        [unroll]                                                        \
+        for (uint w = 0; w < OPURE_ATT_WAVES; ++w) score += gs_part[w];  \
+                                                                         \
+        /* Online softmax rescale. */                                    \
+        const float newMax = max(runningMax, score);                    \
+        const float corr  = (runningMax <= -3.4e38f) ? 0.0f              \
+                                                      : exp(runningMax - newMax); \
+        const float p     = exp(score - newMax);                        \
+                                                                         \
+        runningSum = runningSum * corr + p;                             \
+        const float v = AsF(O_KV[vBase + (s * hd) + lane]);             \
+        acc = acc * corr + p * v;                                       \
+                                                                         \
+        runningMax = newMax;                                            \
+        GroupMemoryBarrierWithGroupSync(); /* protect gs_part */         \
+    }                                                                   \
+                                                                         \
+    if (lane < hd)                                                      \
+    {                                                                   \
+        WrBank(obank, outOff + qBase + lane,                            \
+               AsU(acc / max(runningSum, 1e-30f)));                     \
+    }
+
+[numthreads(32, 1, 1)]
+void AttentionMain32(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                     uint3 grp : SV_GroupID)
 {
-    const uint qOff = P[0], kvOff = P[1], outOff = P[2];
-    const uint nKV = P[3], hd = P[4], maxSeq = P[5], seqLen = P[6], nH = P[7];
-    const uint bank  = P[8];
-    const uint obank = P[9];
-
-    // One group per query head: the HEAD is the group ID, while `lg` is the
-    // lane that owns one channel of the head dimension.
-    const uint h = grp.x;
-    if (h >= nH) return;
-
-    const uint lane = lg;
-    const uint kvGroup = nH / nKV;                 // queries per KV head
-    const uint kvHead  = h / kvGroup;
-    const uint qBase   = h * hd;
-
-    const uint kvLayerStride = maxSeq * nKV * hd;
-    const uint kBase = kvOff + kvHead * maxSeq * hd;
-    const uint vBase = kvOff + kvLayerStride + kvHead * maxSeq * hd;
-
-    float runningMax = -3.402823466e+38f;
-    float runningSum = 0.0f;
-    float acc = 0.0f;                              // this thread's head-dim channel
-
-    const float qv = AsF(RdBank(bank, qOff + qBase + lane));
-
-    for (uint s = 0; s < seqLen; ++s)
-    {
-        const uint kIdx = kBase + (s * hd) + lane;
-
-        // Partial QK^T contribution for this thread's channel, then a SIMD
-        // cross-lane reduction across each wave.
-        const float partial = AsF(O_KV[kIdx]) * qv;
-        const float waveSum = WaveActiveSum(partial);
-
-        if ((lane & (OPURE_WAVE_SIZE - 1)) == 0)
-        {
-            gs_part[lane >> 5] = waveSum;
-        }
-        GroupMemoryBarrierWithGroupSync();
-
-        // Every lane redundantly recombines the <=4 wave scalars; this is one
-        // shared-memory read per sequence step and avoids a second barrier.
-        float score = 0.0f;
-        [unroll]
-        for (uint w = 0; w < 2; ++w) score += gs_part[w];
-
-        // Online softmax rescale.
-        const float newMax = max(runningMax, score);
-        const float corr  = (runningMax <= -3.4e38f) ? 0.0f : exp(runningMax - newMax);
-        const float p     = exp(score - newMax);
-
-        runningSum = runningSum * corr + p;
-        const float v = AsF(O_KV[vBase + (s * hd) + lane]);
-        acc = acc * corr + p * v;
-
-        runningMax = newMax;
-        GroupMemoryBarrierWithGroupSync();   // protect gs_part for the next step
-    }
-
-    if (lane < hd)
-    {
-        WrBank(obank, outOff + qBase + lane, AsU(acc / max(runningSum, 1e-30f)));
-    }
+    OPURE_ATT_BODY
 }
 
-// Entry point compiled with OPURE_ATT_THREADS=128 for head_dim 128 models.
+[numthreads(64, 1, 1)]
+void AttentionMain64(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                     uint3 grp : SV_GroupID)
+{
+    OPURE_ATT_BODY
+}
+
+[numthreads(96, 1, 1)]
+void AttentionMain96(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                     uint3 grp : SV_GroupID)
+{
+    OPURE_ATT_BODY
+}
+
 [numthreads(128, 1, 1)]
 void AttentionMain128(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
                       uint3 grp : SV_GroupID)
 {
-    const uint qOff = P[0], kvOff = P[1], outOff = P[2];
-    const uint nKV = P[3], hd = P[4], maxSeq = P[5], seqLen = P[6], nH = P[7];
-    const uint bank  = P[8];
-    const uint obank = P[9];
+    OPURE_ATT_BODY
+}
 
-    const uint h = grp.x;
-    if (h >= nH) return;
+[numthreads(160, 1, 1)]
+void AttentionMain160(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                      uint3 grp : SV_GroupID)
+{
+    OPURE_ATT_BODY
+}
 
-    const uint lane = lg;
-    const uint kvGroup = nH / nKV;
-    const uint kvHead  = h / kvGroup;
-    const uint qBase   = h * hd;
+[numthreads(192, 1, 1)]
+void AttentionMain192(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                      uint3 grp : SV_GroupID)
+{
+    OPURE_ATT_BODY
+}
 
-    const uint kvLayerStride = maxSeq * nKV * hd;
-    const uint kBase = kvOff + kvHead * maxSeq * hd;
-    const uint vBase = kvOff + kvLayerStride + kvHead * maxSeq * hd;
+[numthreads(224, 1, 1)]
+void AttentionMain224(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                      uint3 grp : SV_GroupID)
+{
+    OPURE_ATT_BODY
+}
 
-    float runningMax = -3.402823466e+38f;
-    float runningSum = 0.0f;
-    float acc = 0.0f;
-
-    const float qv = AsF(RdBank(bank, qOff + qBase + lane));
-
-    for (uint s = 0; s < seqLen; ++s)
-    {
-        const uint kIdx = kBase + (s * hd) + lane;
-        const float partial = AsF(O_KV[kIdx]) * qv;
-        const float waveSum = WaveActiveSum(partial);
-
-        if ((lane & (OPURE_WAVE_SIZE - 1)) == 0) gs_part[lane >> 5] = waveSum;
-        GroupMemoryBarrierWithGroupSync();
-
-        float score = 0.0f;
-        [unroll]
-        for (uint w = 0; w < 4; ++w) score += gs_part[w];
-
-        const float newMax = max(runningMax, score);
-        const float corr  = (runningMax <= -3.4e38f) ? 0.0f : exp(runningMax - newMax);
-        const float p     = exp(score - newMax);
-
-        runningSum = runningSum * corr + p;
-        const float v = AsF(O_KV[vBase + (s * hd) + lane]);
-        acc = acc * corr + p * v;
-
-        runningMax = newMax;
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    if (lane < hd)
-    {
-        WrBank(obank, outOff + qBase + lane, AsU(acc / max(runningSum, 1e-30f)));
-    }
+[numthreads(256, 1, 1)]
+void AttentionMain256(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex,
+                      uint3 grp : SV_GroupID)
+{
+    OPURE_ATT_BODY
 }

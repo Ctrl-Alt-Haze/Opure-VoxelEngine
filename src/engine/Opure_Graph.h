@@ -24,6 +24,7 @@
 
 #include "core/Opure_Platform.h"
 #include "core/Opure_Streamer.h"
+#include "engine/Opure_ModelSpec.h"
 
 namespace opure::json { class Value; }
 
@@ -59,6 +60,14 @@ struct ModelConfig
     bool      attentionBias    = false;
     bool      mlpBias          = false;
     std::string torchDtype;            // informational only
+
+    // "none" when rope_scaling is absent, which is every model this engine has
+    // run. Anything else (llama3, longrope, yaRN, ...) changes the RoPE kernel's
+    // frequency schedule, not just its base theta, so it is reported as
+    // unsupported rather than approximated -- a model that loads and quietly
+    // computes the wrong positions is worse than one that refuses.
+    std::string ropeScalingType  = "none";
+    double      ropeScalingFactor = 1.0;
 
     [[nodiscard]] uint32_t HeadDim()  const { return numHeads ? hiddenSize / numHeads : 0; }
     // Number of query heads sharing one KV head. 1 for MHA, >1 for GQA.
@@ -114,6 +123,9 @@ struct VramPlan
     std::vector<LayerTensors> layers;
     uint64_t embedTokens = 0;   // [vocab, hidden]
     uint64_t finalNorm   = 0;   // [hidden]
+    // The LM head. Equal to embedTokens for tied-embedding models, which is the
+    // common case and costs no extra VRAM.
+    uint64_t lmHead      = 0;   // [vocab, hidden]
 
     // Activation scratch. Three banks of this size (A, B and the residual bank C);
     // see ModelConfig::TotalVramBytes for why three are required.
@@ -174,16 +186,27 @@ public:
 
     // Which attention entry point to use for this model's head_dim. Throws if
     // head_dim is neither 64 nor 128, because no such pipeline exists.
-    enum class AttEntry : uint8_t { Hd64, Hd128 };
+    enum class AttEntry : uint8_t
+    {
+        Hd32, Hd64, Hd96, Hd128, Hd160, Hd192, Hd224, Hd256
+    };
     [[nodiscard]] AttEntry AttentionEntryPoint() const;
+
+    // The resolved file: which tensor fills each graph role, at which dtype.
+    [[nodiscard]] const ModelSpec& Spec() const { return spec_; }
 
 private:
     void PlanLayout();
 
     ModelConfig      cfg_;
     VramPlan         plan_;
+    ModelSpec        spec_;
     safetensors::WeightStreamer stream_;
     bool             loaded_ = false;
 };
+
+// Small file helpers exposed for tooling.
+[[nodiscard]] std::string ReadSmallFile(const std::wstring& path);
+[[nodiscard]] std::wstring JoinPath(const std::wstring& dir, const wchar_t* leaf);
 
 } // namespace opure::graph

@@ -27,7 +27,16 @@ void Library::Initialize(dx12::Device& dev)
     static_assert(static_cast<uint32_t>(Id::WeightCommit) + 1u ==
                   static_cast<uint32_t>(kShaderCount),
                   "kShaderCount does not match the number of pipelines in Id");
-    OPURE_ASSERT(kShaderCount == 16);
+    OPURE_ASSERT(kShaderCount == 22);
+
+    // The attention entry points are the one place where a mapping mistake is
+    // invisible: a head_dim-64 model dispatched onto the 256-thread pipeline
+    // would still produce finite logits, just wrong ones, because 192 of the 256
+    // lanes read past the head. So the name-to-thread-count contract is asserted
+    // rather than trusted.
+    static_assert(static_cast<uint32_t>(Id::Attention256) ==
+                  static_cast<uint32_t>(Id::Attention32) + 7u,
+                  "attention entry points must be contiguous from 32 to 256");
 
     // Map our Id enum onto the generated table order.
     struct Entry { Id id; const ShaderBlob* blob; const char* name; };
@@ -40,8 +49,14 @@ void Library::Initialize(dx12::Device& dev)
         { Id::RoPE,         &kShaderTable[static_cast<size_t>(ShaderId::RoPEMain)],         "RoPE"         },
         { Id::GEMV,         &kShaderTable[static_cast<size_t>(ShaderId::GEMVMain)],         "GEMV"         },
         { Id::GEMVQuant,    &kShaderTable[static_cast<size_t>(ShaderId::GEMVQuantMain)],    "GEMVQuant"    },
-        { Id::Attention,    &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain)],    "Attention64"  },
+        { Id::Attention32,  &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain32)],  "Attention32"  },
+        { Id::Attention64,  &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain64)],  "Attention64"  },
+        { Id::Attention96,  &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain96)],  "Attention96"  },
         { Id::Attention128, &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain128)], "Attention128" },
+        { Id::Attention160, &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain160)], "Attention160" },
+        { Id::Attention192, &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain192)], "Attention192" },
+        { Id::Attention224, &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain224)], "Attention224" },
+        { Id::Attention256, &kShaderTable[static_cast<size_t>(ShaderId::AttentionMain256)], "Attention256" },
         { Id::SwiGLU,       &kShaderTable[static_cast<size_t>(ShaderId::SwiGLUMain)],       "SwiGLU"       },
         { Id::Add,          &kShaderTable[static_cast<size_t>(ShaderId::AddMain)],          "Add"          },
         { Id::AddRes,       &kShaderTable[static_cast<size_t>(ShaderId::AddResMain)],       "AddRes"       },

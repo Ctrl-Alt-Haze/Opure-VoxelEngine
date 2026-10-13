@@ -4,6 +4,9 @@
 // ============================================================================
 #include "engine/Opure_Graph.h"
 
+#include "core/Opure_Json.h"
+#include "engine/Opure_ModelSpec.h"
+
 #include "core/Opure_Dx12.h"
 #include "core/Opure_Json.h"
 
@@ -15,8 +18,9 @@
 namespace opure::graph
 {
 
-namespace
-{
+// ---------------------------------------------------------------------------
+//  Small file helpers used by the graph and by tooling.
+// ---------------------------------------------------------------------------
 
 // Reads a whole small file into memory. Used for config.json only; the model
 // weights go through WeightStreamer's mapping instead.
@@ -24,30 +28,30 @@ std::string ReadSmallFile(const std::wstring& path)
 {
     HANDLE f = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (f == INVALID_HANDLE_VALUE) { ThrowError("cannot open config.json in the model directory"); }
-
-    LARGE_INTEGER size{};
-    if (!::GetFileSizeEx(f, &size) || size.QuadPart <= 0)
+    if (f == INVALID_HANDLE_VALUE)
     {
-        ::CloseHandle(f);
-        ThrowError("config.json is empty");
+        ThrowError("cannot open config.json in the model directory");
     }
-    std::string text(static_cast<size_t>(size.QuadPart), '\0');
-    DWORD got = 0;
-    const BOOL ok = ::ReadFile(f, text.data(), static_cast<DWORD>(text.size()), &got, nullptr);
+    LARGE_INTEGER sz;
+    ::GetFileSizeEx(f, &sz);
+    std::string out(static_cast<size_t>(sz.QuadPart), '\0');
+    DWORD read = 0;
+    ::ReadFile(f, out.data(), static_cast<DWORD>(sz.QuadPart), &read, nullptr);
     ::CloseHandle(f);
-    if (!ok) { ThrowError("ReadFile failed on config.json"); }
-    text.resize(got);
-    return text;
+    return out;
 }
 
+// Appends a leaf name to a directory path, inserting a backslash if needed.
 std::wstring JoinPath(const std::wstring& dir, const wchar_t* leaf)
 {
-    std::wstring p = dir;
-    if (!p.empty() && p.back() != L'\\' && p.back() != L'/') { p.push_back(L'\\'); }
-    p += leaf;
-    return p;
+    if (dir.empty()) { return leaf; }
+    wchar_t last = dir.back();
+    if (last == L'\\' || last == L'/') { return dir + leaf; }
+    return dir + L'\\' + leaf;
 }
+
+namespace
+{
 
 uint32_t GetU32(const json::Value& o, const char* key, std::string_view ctx)
 {
@@ -110,6 +114,24 @@ ModelConfig ModelConfig::Parse(std::string_view jsonText)
     else
     {
         c.ropeTheta = 10000.0;
+    }
+
+    if (const json::Value* v = root.Find("rope_scaling");
+        v != nullptr && v->IsObject())
+    {
+        // Newer checkpoints write "rope_type"; older ones write "type".
+        if (const json::Value* rt = v->Find("rope_type"); rt != nullptr && rt->IsString())
+        {
+            c.ropeScalingType = rt->str;
+        }
+        else if (const json::Value* ty = v->Find("type"); ty != nullptr && ty->IsString())
+        {
+            c.ropeScalingType = ty->str;
+        }
+        if (const json::Value* f = v->Find("factor"); f != nullptr)
+        {
+            c.ropeScalingFactor = f->num;
+        }
     }
 
     c.rmsNormEpsBits = FloatBits(static_cast<float>(root.GetNum("rms_norm_eps", ctx)));
@@ -260,6 +282,17 @@ void Graph::LoadConfigOnly(const std::wstring& modelDir, uint64_t availableVramB
     }
 
     stream_.Open(JoinPath(modelDir, L"model.safetensors"));
+
+    // Resolve the file into graph roles BEFORE planning, so a model this engine
+    // cannot serve is refused with a specific reason instead of an
+    // out-of-range or a name-not-found deep inside layout.
+    spec_.Resolve(cfg_, stream_);
+    spec_.Check(cfg_);
+    if (!spec_.Supported())
+    {
+        ThrowError("model is not supported by this engine:\n" + spec_.Explain());
+    }
+
     PlanLayout();
 
     plan_.availableBytes = availableVramBytes;
@@ -288,29 +321,46 @@ void Graph::PlanLayout()
     auto place = [&](const safetensors::Tensor& t) -> uint64_t
     {
         const uint64_t at = cursor;
-        // Tensors are 4-byte aligned by construction; 256 keeps every row of a
-        // GEMV 64-byte-segment friendly.
+        // The resident format is always F32, so every tensor occupies four bytes
+        // per element regardless of how the file stores it; a BF16 source is
+        // widened on the host at upload time. 256-byte alignment keeps every row
+        // of a GEMV 64-byte-segment friendly.
         cursor += Align64(t.ElementCount() * 4, 256);
         return at / 4;   // word offset
     };
 
-    plan_.embedTokens = place(stream_.Find("model.embed_tokens.weight"));
-    plan_.finalNorm   = place(stream_.Find("model.norm.weight"));
+    auto placeRef = [&](const TensorRef& r) -> uint64_t
+    {
+        return place(stream_.Find(r.name));
+    };
+
+    plan_.embedTokens = placeRef(spec_.Embed());
+    plan_.finalNorm   = placeRef(spec_.FinalNorm());
+    // A tied model has no separate head; the graph points the LM head at the
+    // embedding table, so no extra VRAM is reserved.
+    if (spec_.LmHead().Present() && !cfg_.tieWordEmbeddings)
+    {
+        plan_.lmHead = placeRef(spec_.LmHead());
+    }
+    else
+    {
+        plan_.lmHead = plan_.embedTokens;
+    }
 
     plan_.layers.resize(cfg_.numLayers);
     for (uint32_t l = 0; l < cfg_.numLayers; ++l)
     {
-        const std::string p = "model.layers." + std::to_string(l) + ".";
+        const BlockTensors& b = spec_.Blocks()[l];
         VramPlan::LayerTensors& lt = plan_.layers[l];
-        lt.inputNorm   = place(stream_.Find(p + "input_layernorm.weight"));
-        lt.postAttNorm = place(stream_.Find(p + "post_attention_layernorm.weight"));
-        lt.wq          = place(stream_.Find(p + "self_attn.q_proj.weight"));
-        lt.wk          = place(stream_.Find(p + "self_attn.k_proj.weight"));
-        lt.wv          = place(stream_.Find(p + "self_attn.v_proj.weight"));
-        lt.wo          = place(stream_.Find(p + "self_attn.o_proj.weight"));
-        lt.gate        = place(stream_.Find(p + "mlp.gate_proj.weight"));
-        lt.up          = place(stream_.Find(p + "mlp.up_proj.weight"));
-        lt.down        = place(stream_.Find(p + "mlp.down_proj.weight"));
+        lt.inputNorm   = placeRef(b.inputNorm);
+        lt.postAttNorm = placeRef(b.postAttNorm);
+        lt.wq          = placeRef(b.wq);
+        lt.wk          = placeRef(b.wk);
+        lt.wv          = placeRef(b.wv);
+        lt.wo          = placeRef(b.wo);
+        lt.gate        = placeRef(b.gate);
+        lt.up          = placeRef(b.up);
+        lt.down        = placeRef(b.down);
     }
 
     plan_.weightWords = cursor;
@@ -350,12 +400,27 @@ void Graph::PlanLayout()
 
 Graph::AttEntry Graph::AttentionEntryPoint() const
 {
+    // Which precompiled attention pipeline serves this model's head_dim.
+    // Keep in sync with Library::AttentionFor; this one exists so callers can
+    // ask the graph rather than reaching into the shader library.
     const uint32_t hd = cfg_.HeadDim();
-    if (hd == 64)  { return AttEntry::Hd64; }
-    if (hd == 128) { return AttEntry::Hd128; }
-    // Validate() already rejects this, so reaching here means Load() was
-    // bypassed.
-    ThrowError("head_dim " + std::to_string(hd) + " has no attention entry point");
+    switch (hd)
+    {
+    case 32:  return AttEntry::Hd32;
+    case 64:  return AttEntry::Hd64;
+    case 96:  return AttEntry::Hd96;
+    case 128: return AttEntry::Hd128;
+    case 160: return AttEntry::Hd160;
+    case 192: return AttEntry::Hd192;
+    case 224: return AttEntry::Hd224;
+    case 256: return AttEntry::Hd256;
+    default:
+        // ModelSpec::Check refuses these at load time, so reaching here means
+        // LoadConfigOnly was bypassed.
+        ThrowError("head_dim " + std::to_string(hd) +
+                   " has no compiled attention kernel (must be a multiple of 32, "
+                   "at most 256)");
+    }
 }
 
 // Copies every weight into the GPU weight buffer in planned order.
@@ -365,34 +430,82 @@ Graph::AttEntry Graph::AttentionEntryPoint() const
 // 32 MB batch, not one per tensor.
 void Graph::UploadWeights(dx12::Device& dev, dx12::GpuBuffer& weights)
 {
-    struct Piece { uint64_t wordOffset; std::string name; };
+    // Two paths, because the resident format is always F32 but the file usually
+    // is not.
+    //
+    //   F32  -> zero-copy: hand the mapping's bytes straight to the uploader.
+    //   other -> widen on the host into ONE staging buffer, then upload ranges
+    //            into it. A per-tensor temporary would alias, since every
+    //            converted range would point at the same reused allocation.
+    //
+    // The previous code copied bytes verbatim regardless of dtype, so a BF16
+    // model -- which is what nearly every real checkpoint ships -- would have put
+    // 2-byte payloads into 4-byte slots and produced a model that loaded cleanly
+    // and computed nonsense.
+    struct Piece { uint64_t wordOffset; const TensorRef* ref; };
+
     std::vector<Piece> pieces;
     pieces.reserve(2 + plan_.layers.size() * 9);
 
-    pieces.push_back({ plan_.embedTokens, "model.embed_tokens.weight" });
-    pieces.push_back({ plan_.finalNorm,   "model.norm.weight" });
+    pieces.push_back({ plan_.embedTokens, &spec_.Embed() });
+    pieces.push_back({ plan_.finalNorm,   &spec_.FinalNorm() });
+    if (plan_.lmHead != plan_.embedTokens)
+    {
+        pieces.push_back({ plan_.lmHead, &spec_.LmHead() });
+    }
 
     for (size_t l = 0; l < plan_.layers.size(); ++l)
     {
-        const std::string p = "model.layers." + std::to_string(l) + ".";
-        const graph::VramPlan::LayerTensors& t = plan_.layers[l];
-        pieces.push_back({ t.inputNorm,   p + "input_layernorm.weight" });
-        pieces.push_back({ t.postAttNorm, p + "post_attention_layernorm.weight" });
-        pieces.push_back({ t.wq, p + "self_attn.q_proj.weight" });
-        pieces.push_back({ t.wk, p + "self_attn.k_proj.weight" });
-        pieces.push_back({ t.wv, p + "self_attn.v_proj.weight" });
-        pieces.push_back({ t.wo, p + "self_attn.o_proj.weight" });
-        pieces.push_back({ t.gate, p + "mlp.gate_proj.weight" });
-        pieces.push_back({ t.up,   p + "mlp.up_proj.weight" });
-        pieces.push_back({ t.down, p + "mlp.down_proj.weight" });
+        const BlockTensors& b = spec_.Blocks()[l];
+        const VramPlan::LayerTensors& t = plan_.layers[l];
+        pieces.push_back({ t.inputNorm,   &b.inputNorm });
+        pieces.push_back({ t.postAttNorm, &b.postAttNorm });
+        pieces.push_back({ t.wq, &b.wq });
+        pieces.push_back({ t.wk, &b.wk });
+        pieces.push_back({ t.wv, &b.wv });
+        pieces.push_back({ t.wo, &b.wo });
+        pieces.push_back({ t.gate, &b.gate });
+        pieces.push_back({ t.up,   &b.up });
+        pieces.push_back({ t.down, &b.down });
     }
 
+    // ---- pass 1: raw F32 ranges -------------------------------------------
     std::vector<dx12::Device::UploadRange> ranges;
     ranges.reserve(pieces.size());
-    for (const Piece& pc : pieces)
+
+    // ---- pass 2 staging layout (allocated only if something needs widening)
+    std::vector<uint64_t> stageOffset(pieces.size(), 0);
+    uint64_t stageWords = 0;
+    for (size_t i = 0; i < pieces.size(); ++i)
     {
-        const safetensors::Tensor& t = stream_.Find(pc.name);
-        ranges.push_back({ stream_.Data(t), t.ByteCount(), pc.wordOffset * 4 });
+        if (pieces[i].ref->dtype == safetensors::Dtype::F32) { continue; }
+        stageOffset[i] = stageWords;
+        stageWords += pieces[i].ref->Elements();
+    }
+
+    std::vector<float> staging;
+    if (stageWords != 0)
+    {
+        staging.resize(static_cast<size_t>(stageWords));
+    }
+
+    for (size_t i = 0; i < pieces.size(); ++i)
+    {
+        const TensorRef& r = *pieces[i].ref;
+        const safetensors::Tensor& t = stream_.Find(r.name);
+
+        if (r.dtype == safetensors::Dtype::F32)
+        {
+            ranges.push_back({ stream_.Data(t), t.ByteCount(), pieces[i].wordOffset * 4 });
+        }
+        else
+        {
+            safetensors::WidenToF32(r.dtype, stream_.Data(t), r.Elements(),
+                                    staging.data() + stageOffset[i]);
+            ranges.push_back({ staging.data() + stageOffset[i],
+                               r.Elements() * 4,
+                               pieces[i].wordOffset * 4 });
+        }
     }
 
     dev.UploadRanges(weights, ranges);

@@ -95,6 +95,14 @@ add_executable(opure_harness
 target_link_libraries(opure_harness PRIVATE OpureVoxelEngine opure_warnings)
 
 # ---------------------------------------------------------------------------
+#  Inspector executable -- reads a model dir and emits a support report
+# ---------------------------------------------------------------------------
+add_executable(opure_inspect
+    src/app/Opure_Inspect.cpp
+)
+target_link_libraries(opure_inspect PRIVATE OpureVoxelEngine opure_warnings)
+
+# ---------------------------------------------------------------------------
 #  Shader compilation -> embedded DXIL blob
 # ---------------------------------------------------------------------------
 find_program(OPURE_DXC

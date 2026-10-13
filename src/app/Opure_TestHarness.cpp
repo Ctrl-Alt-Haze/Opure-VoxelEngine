@@ -1326,13 +1326,21 @@ void TestArgMax(Device& dev, shaders::Library& lib, Gpu& gpu)
 }
 
 // ---- Decode attention ---------------------------------------------------
-void TestAttention(Device& dev, shaders::Library& lib, Gpu& gpu)
+// Attention is the one kernel that is compiled eight times, once per supported
+// head_dim, because the group width IS head_dim. Testing only one of them is how
+// the other seven could rot unnoticed: a 64-thread model dispatched onto the
+// 256-thread pipeline still returns finite numbers, just the wrong ones, since
+// 192 lanes read past the end of the head. So this runs the full matrix.
+void TestAttentionAt(Device& dev, shaders::Library& lib, Gpu& gpu,
+                     uint32_t kHD, const char* label)
 {
-    constexpr uint32_t kHeads = 4, kKV = 2, kHD = 64, kSeq = 7, kMax = 64;
+    constexpr uint32_t kHeads = 4, kKV = 2, kSeq = 7, kMax = 64;
     const uint64_t kvOff = 0;
     const uint64_t kvStride = static_cast<uint64_t>(kMax) * kKV * kHD;
 
-    Rng rng(0xABCDEF01u);
+    // A distinct seed per head_dim: reusing one would let a wrong-lane mapping
+    // pass on symmetric data by coincidence.
+    Rng rng(0xABCDEF01u ^ (kHD * 2654435761u));
     std::vector<uint32_t> Q(kHeads * kHD);
     std::vector<uint32_t> K(kKV * kMax * kHD), V(kKV * kMax * kHD);
     for (auto& v : Q) { const float f = rng.NextF();  std::memcpy(&v, &f, 4); }
@@ -1348,7 +1356,9 @@ void TestAttention(Device& dev, shaders::Library& lib, Gpu& gpu)
     dev.ResetCommandList();
     {
         CommandScope cs(dev);
-        cs.SetPipeline(lib.Get(shaders::Id::Attention));
+        const shaders::Id id = shaders::Library::AttentionFor(kHD);
+        OPURE_ASSERT(id != shaders::Id::Count);
+        cs.SetPipeline(lib.Get(id));
         cs.SetParams(p, 10);
         cs.Dispatch(kHeads, 1, 1);
     }
@@ -1387,7 +1397,8 @@ void TestAttention(Device& dev, shaders::Library& lib, Gpu& gpu)
         }
         for (uint32_t d = 0; d < kHD; ++d) ref[h * kHD + d] = acc[d] / l;
     }
-    Report("Attention [4h/2kv/7s]", Compare(got, ref), 1e-4);
+    std::string lbl = std::string("Attention ") + label + " [4h/2kv/7s]";
+        Report(lbl.c_str(), Compare(got, ref), 1e-4);
 }
 
 // ---- AddRes: cross-bank residual add ---------------------------------------
@@ -1656,7 +1667,14 @@ int main()
         TestAddRes(dev, lib, gpu);
 TestPlasticity(dev, lib, gpu);
         TestArgMax(dev, lib, gpu);
-        TestAttention(dev, lib, gpu);
+        TestAttentionAt(dev, lib, gpu, 32,  "hd32");
+        TestAttentionAt(dev, lib, gpu, 64,  "hd64");
+        TestAttentionAt(dev, lib, gpu, 96,  "hd96");
+        TestAttentionAt(dev, lib, gpu, 128, "hd128");
+        TestAttentionAt(dev, lib, gpu, 160, "hd160");
+        TestAttentionAt(dev, lib, gpu, 192, "hd192");
+        TestAttentionAt(dev, lib, gpu, 224, "hd224");
+        TestAttentionAt(dev, lib, gpu, 256, "hd256");
 
         std::printf("\nperformance:\n");
         BenchGEMV(dev, lib, gpu);

@@ -335,8 +335,8 @@ void VoxelEngine::RecordForward(const uint32_t tokenId, const uint32_t position,
 
         // Attention: reads the rotated q from LB.rope, writes into LB.attn.
         {
-            const shaders::Id id = (hd == 64) ? shaders::Id::Attention
-                                              : shaders::Id::Attention128;
+            const shaders::Id id = shaders::Library::AttentionFor(hd);
+            OPURE_ASSERT(id != shaders::Id::Count);   // ModelSpec::Check refused this
             const uint32_t p[10] = {
                 scratchQ_, kvLayerOff, scratchA_,
                 cfg.numKvHeads, hd, cfg.maxPositions, position + 1, cfg.numHeads,

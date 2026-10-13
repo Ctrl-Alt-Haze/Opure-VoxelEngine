@@ -30,14 +30,28 @@ enum class Id : uint32_t
     RoPE,
     GEMV,
     GEMVQuant,
-    Attention,        // head_dim == 64  (256-thread group would idle; see .usf)
-    Attention128,     // head_dim == 128
+    // One entry point per supported head_dim. Group width IS head_dim, so each
+    // needs its own compilation rather than a runtime branch; see
+    // AttentionFor() and Opure_FlashAttention_Decode.usf.
+    Attention32,
+    Attention64,
+    Attention96,
+    Attention128,
+    Attention160,
+    Attention192,
+    Attention224,
+    Attention256,
     SwiGLU,
     Add,
     AddRes,      // cross-bank residual add (residual lives in bank C)
     ArgMax,
     SignSGD,     // idle-time weight update, staged into an activation bank
-    WeightCommit // copies staged weights back over the real tensor
+    WeightCommit, // copies staged weights back over the real tensor
+
+    // Sentinel, not a pipeline. Lets AttentionFor() return something for an
+    // unsupported head_dim so callers get a diagnosable failure instead of an
+    // out-of-range vector access.
+    Count
 };
 
 class Library
@@ -54,10 +68,28 @@ public:
     }
 
     // Returns the pipeline whose thread-group width matches the model's head
-    // dimension, so both head_dim 64 and 128 models get fully occupied groups.
-    [[nodiscard]] Id AttentionFor(uint32_t headDim) const
+    // dimension. head_dim must be a positive multiple of the wave size; anything
+    // else has no entry point, and the caller should have been refused at
+    // model-load time by ModelSpec::Check.
+    [[nodiscard]] static Id AttentionFor(uint32_t headDim)
     {
-        return (headDim > 64) ? Id::Attention128 : Id::Attention;
+        switch (headDim)
+        {
+        case 32:  return Id::Attention32;
+        case 64:  return Id::Attention64;
+        case 96:  return Id::Attention96;
+        case 128: return Id::Attention128;
+        case 160: return Id::Attention160;
+        case 192: return Id::Attention192;
+        case 224: return Id::Attention224;
+        case 256: return Id::Attention256;
+        default:  return Id::Count;   // sentinel: caller must not dispatch this
+        }
+    }
+
+    [[nodiscard]] static constexpr bool HasAttentionFor(uint32_t headDim)
+    {
+        return headDim != 0 && headDim <= 256 && (headDim % 32u) == 0;
     }
 
 private:
