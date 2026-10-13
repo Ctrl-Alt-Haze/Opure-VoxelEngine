@@ -40,6 +40,9 @@ void Library::Initialize(dx12::Device& dev)
     static_assert(static_cast<uint32_t>(Id::SpecVerify256) ==
                   static_cast<uint32_t>(Id::SpecVerify32) + 7u,
                   "speculative verify entry points must be contiguous from 32 to 256");
+    static_assert(static_cast<uint32_t>(Id::SpecVerify160) ==
+                  static_cast<uint32_t>(Id::SpecVerify32) + 4u,
+                  "speculative verify entry points must be contiguous from 32 to 256");
 
     // Map our Id enum onto the generated table order.
     struct Entry { Id id; const ShaderBlob* blob; const char* name; };
