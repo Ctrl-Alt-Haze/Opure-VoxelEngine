@@ -58,6 +58,8 @@ enum class Id : uint32_t
     Add,
     AddRes,      // cross-bank residual add (residual lives in bank C)
     ArgMax,
+    Memmove,      // GPU memmove for KV cache sliding window
+
     SignSGD,     // idle-time weight update, staged into an activation bank
     WeightCommit, // copies staged weights back over the real tensor
 

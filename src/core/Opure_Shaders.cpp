@@ -27,7 +27,7 @@ void Library::Initialize(dx12::Device& dev)
     static_assert(static_cast<uint32_t>(Id::WeightCommit) + 1u ==
                   static_cast<uint32_t>(kShaderCount),
                   "kShaderCount does not match the number of pipelines in Id");
-    OPURE_ASSERT(kShaderCount == 30);
+    OPURE_ASSERT(kShaderCount == 31);
 
     // The attention entry points are the one place where a mapping mistake is
     // invisible: a head_dim-64 model dispatched onto the 256-thread pipeline
@@ -43,6 +43,9 @@ void Library::Initialize(dx12::Device& dev)
     static_assert(static_cast<uint32_t>(Id::SpecVerify160) ==
                   static_cast<uint32_t>(Id::SpecVerify32) + 4u,
                   "speculative verify entry points must be contiguous from 32 to 256");
+    static_assert(static_cast<uint32_t>(Id::Memmove) ==
+                  static_cast<uint32_t>(Id::ArgMax) + 1u,
+                  "Memmove must follow ArgMax");
 
     // Map our Id enum onto the generated table order.
     struct Entry { Id id; const ShaderBlob* blob; const char* name; };
@@ -75,6 +78,7 @@ void Library::Initialize(dx12::Device& dev)
         { Id::Add,          &kShaderTable[static_cast<size_t>(ShaderId::AddMain)],          "Add"          },
         { Id::AddRes,       &kShaderTable[static_cast<size_t>(ShaderId::AddResMain)],       "AddRes"       },
         { Id::ArgMax,       &kShaderTable[static_cast<size_t>(ShaderId::ArgMaxMain)],       "ArgMax"       },
+        { Id::Memmove,      &kShaderTable[static_cast<size_t>(ShaderId::MemmoveMain)],      "Memmove"      },
         { Id::SignSGD,      &kShaderTable[static_cast<size_t>(ShaderId::SignSGDMain)],      "SignSGD"      },
         { Id::WeightCommit, &kShaderTable[static_cast<size_t>(ShaderId::CommitMain)],      "WeightCommit" },
     };

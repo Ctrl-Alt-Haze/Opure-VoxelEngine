@@ -82,6 +82,7 @@ $manifest = [ordered]@{
         @{ Entry = 'SpeculativeVerifyMain224'; Defines = @('OPURE_ATT_THREADS=224') },
         @{ Entry = 'SpeculativeVerifyMain256'; Defines = @('OPURE_ATT_THREADS=256') }
     )
+    'Opure_Memmove' = @('MemmoveMain')
     'Opure_SwiGLU'                = @('SwiGLUMain')
     'Opure_Add'                   = @('AddMain')
     'Opure_AddRes'                = @('AddResMain')

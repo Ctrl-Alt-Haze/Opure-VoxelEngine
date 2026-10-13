@@ -1,0 +1,26 @@
+// ============================================================================
+//  Opure_Memmove.usf
+//  Simple GPU memmove for KV cache sliding window.
+// ============================================================================
+//  Copies [src, src+count) -> [dst, dst+count) word by word.
+//  One thread per element, 256 threads per group.
+// ============================================================================
+#include "Opure_Common.hlsl"
+
+[numthreads(256, 1, 1)]
+void MemmoveMain(uint3 tid : SV_DispatchThreadID, uint lg : SV_GroupIndex, uint3 grp : SV_GroupID)
+{
+    const uint srcOff = P[0];
+    const uint dstOff = P[1];
+    const uint count  = P[2];
+    const uint bank   = P[3];  // both src and dst in same bank
+
+    const uint idx = grp.x * 256 + lg;
+    if (idx >= P[2]) return;
+
+    const uint srcIdx = srcOff + idx;
+    const uint dstIdx = dstOff + idx;
+
+    const uint val = RdBank(bank, srcIdx);
+    WrBank(bank, dstIdx, val);
+}

@@ -196,6 +196,10 @@ public:
     // per generated token rather than O(sequence length).
     uint32_t DecodeStep(uint32_t tokenId, uint32_t position);
 
+    // Evicts the oldest KV cache entry by shifting all entries left by one.
+    // Called when the sequence reaches max_position_embeddings.
+    void EvictOldestKV();
+
     // Reduces logits already present in `logitBank` to their argmax token id.
     uint32_t ArgMaxFrom(uint32_t logitBank);
 

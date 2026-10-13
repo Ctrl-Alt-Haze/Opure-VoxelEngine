@@ -626,10 +626,67 @@ void VoxelEngine::Prefill(const std::vector<uint32_t>& tokens, uint32_t* logitBa
 // ---------------------------------------------------------------------------
 //  One decode step: append `tokenId` at `position` and reduce to the argmax.
 //  Only the new token is computed; earlier positions come from the KV cache.
+// ---------------------------------------------------------------------------
+//  KV cache sliding-window eviction.
+//  When the sequence reaches maxPositions, we evict the oldest token by
+//  shifting the K/V cache left by one position. This is a memmove on the GPU
+//  via a simple copy dispatch (one thread per element).
+// ---------------------------------------------------------------------------
+void VoxelEngine::EvictOldestKV()
+{
+    const auto& cfg = graph_.Config();
+    const uint32_t maxPos = cfg.maxPositions;
+    const uint32_t kvHidden = cfg.numKvHeads * cfg.HeadDim();
+    const uint32_t kvLayerWords = maxPos * kvHidden;
+    const uint32_t elementsPerLayer = 2 * kvLayerWords;  // K + V per layer
+    for (uint32_t L = 0; L < cfg.numLayers; ++L)
+    {
+        const uint64_t kvLayerOff = L * cfg.maxPositions * cfg.numKvHeads * cfg.HeadDim();
+        const uint32_t kBase = static_cast<uint32_t>(kvLayerOff);
+        const uint32_t vBase = static_cast<uint32_t>(kvLayerOff + maxPos * cfg.numKvHeads * cfg.HeadDim());
+
+        // Shift K cache: [1..maxPos-1] -> [0..maxPos-2]
+        {
+            dev_->ResetCommandList();
+            {
+                dx12::CommandScope cs(*dev_);
+                const uint32_t p[4] = { kBase + kvHidden, kBase, elementsPerLayer / 2, 0 };  // src, dst, count, bank
+                cs.Barrier();
+                cs.SetPipeline(lib_->Get(shaders::Id::Memmove));
+                cs.SetParams(p, 4);
+                cs.Dispatch((elementsPerLayer / 2 + 255) / 256, 1, 1);
+            }
+            dev_->ExecuteAndWait();
+        }
+
+        // Shift V cache: [1..maxPos-1] -> [0..maxPos-2]
+        {
+            dev_->ResetCommandList();
+            {
+                dx12::CommandScope cs(*dev_);
+                
+                const uint32_t p[4] = { vBase + kvHidden, vBase, elementsPerLayer / 2, 0 };
+                cs.Barrier();
+                cs.SetPipeline(lib_->Get(shaders::Id::Memmove));
+                cs.SetParams(p, 4);
+                cs.Dispatch((elementsPerLayer / 2 + 255) / 256, 1, 1);
+            }
+            dev_->ExecuteAndWait();
+        }
+    }
+}
+
 uint32_t VoxelEngine::DecodeStep(uint32_t tokenId, uint32_t position)
 {
     OPURE_CHECK(position < graph_.Config().maxPositions,
                 "decode position exceeds max_position_embeddings");
+
+    // If we're at capacity, evict oldest before writing new token.
+    if (seqLen_ >= graph_.Config().maxPositions)
+    {
+        EvictOldestKV();
+        // After eviction, logical position is maxPositions - 1.
+    }
 
     dev_->ResetCommandList();
 
