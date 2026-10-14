@@ -29,41 +29,39 @@ class ChatEngine {
 public:
     bool Init(const std::wstring& modelDir) {
         dev_ = std::make_unique<dx12::Device>();
+        // Device's constructor is defaulted; Initialize() is what enumerates the
+        // adapter, creates the D3D12 device/queue/root signature and records the
+        // VRAM budget. Without it dedicatedVram_ stays 0 and every model is
+        // rejected by the VRAM admission gate as "0 MiB available".
+        dev_->Initialize();
         gpuName_ = dx12::DeviceName();
         vramTotal_ = dev_->DedicatedVideoMemory();
-
-        graph_ = std::make_unique<graph::Graph>();
-        graph_->LoadConfigOnly(modelDir, vramTotal_);
-
-        if (!graph_->Plan().fits) {
-            std::cerr << "Model requires " << (graph_->Plan().totalBytes >> 20)
-                      << " MiB but only " << (vramTotal_ >> 20) << " MiB available.\n";
-            return false;
-        }
-
-        weights_.Create(*dev_, dx12::kSlotWeights, graph_->Plan().totalBytes, true);
-        activations_.Create(*dev_, 1, graph_->Plan().actBytes, true);
-        kvCache_.Create(*dev_, 3, graph_->Plan().kvBytes, true);
-        params_.Create(*dev_, 5, dx12::kParamBytes, true);
 
         lib_ = std::make_unique<shaders::Library>();
         lib_->Initialize(*dev_);
 
-        graph_->UploadWeights(*dev_, weights_);
-
-        tokenizer_ = std::make_unique<tokenizer::BpeTokenizer>();
-        tokenizer_->LoadFromFile(modelDir + L"\\tokenizer.json");
-
+        // VoxelEngine owns the graph, every GPU buffer, the weight upload and the
+        // tokenizer. Standing up a second copy of all of that here allocated a
+        // second full weight buffer (~2 GB on SmolLM) that nothing ever read, on
+        // top of the engine's own -- which is most of why the TUI could not get
+        // off the ground. The model description is read back off the engine's
+        // graph afterwards instead of from a private one.
         engine::EngineOptions opts;
         opts.enablePlasticity = false;
-        engine_.Initialize(modelDir, opts, dev_.get(), lib_.get());
+        try {
+            engine_.Initialize(modelDir, opts, dev_.get(), lib_.get());
+        } catch (const std::exception& e) {
+            std::cerr << "Engine init failed: " << e.what() << "\n";
+            return false;
+        }
 
-        std::cout << "Loaded: " << graph_->Config().architecture << "  "
-                  << graph_->Config().numLayers << "L  "
-                  << graph_->Config().hiddenSize << "H  "
-                  << graph_->Config().numHeads << "h/" << graph_->Config().numKvHeads << "kv  "
-                  << graph_->Config().HeadDim() << "hd\n";
-        std::cout << "VRAM: " << (graph_->Plan().totalBytes >> 20) << " MiB / "
+        const auto& cfg = engine_.GraphModel().Config();
+        std::cout << "Loaded: " << cfg.architecture << "  "
+                  << cfg.numLayers << "L  "
+                  << cfg.hiddenSize << "H  "
+                  << cfg.numHeads << "h/" << cfg.numKvHeads << "kv  "
+                  << cfg.HeadDim() << "hd\n";
+        std::cout << "VRAM: " << (engine_.GraphModel().Plan().totalBytes >> 20) << " MiB / "
                   << (vramTotal_ >> 20) << " MiB\n";
         return true;
     }
@@ -91,13 +89,9 @@ public:
 
 private:
     std::unique_ptr<dx12::Device> dev_;
-    dx12::GpuBuffer weights_;
-    dx12::GpuBuffer activations_;
-    dx12::GpuBuffer kvCache_;
-    dx12::GpuBuffer params_;
     std::unique_ptr<shaders::Library> lib_;
-    std::unique_ptr<graph::Graph> graph_;
-    std::unique_ptr<tokenizer::BpeTokenizer> tokenizer_;
+    // The engine owns the graph, the GPU buffers and the tokenizer; it exposes
+    // them rather than the app duplicating them. Tokenizer() is the accessor.
     engine::VoxelEngine engine_;
 
     std::string gpuName_;
@@ -112,7 +106,7 @@ Commands:
     }
 
     void Generate(const std::string& prompt) {
-        std::vector<uint32_t> tokens = tokenizer_->Encode(prompt);
+        std::vector<uint32_t> tokens = engine_.Tokenizer().Encode(prompt);
         if (tokens.empty()) {
             std::cerr << "Prompt tokenized to empty.\n";
             return;
@@ -129,9 +123,9 @@ Commands:
         // Stream the generated tokens
         bool firstToken = true;
         for (uint32_t tok : result.generated) {
-            if (tok == tokenizer_->SpecialId("<|endoftext|>")) break;
+            if (tok == engine_.Tokenizer().SpecialId("<|endoftext|>")) break;
 
-            std::string tokenStr = tokenizer_->Decode(tok);
+            std::string tokenStr = engine_.Tokenizer().Decode(tok);
 
             if (firstToken) {
                 firstToken = false;

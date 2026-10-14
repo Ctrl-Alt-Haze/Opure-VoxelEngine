@@ -160,4 +160,4 @@ target_link_libraries(opure_chat PRIVATE OpureVoxelEngine opure_warnings)
 add_executable(opure_server
     src/app/Opure_Server.cpp
 )
-target_link_libraries(opure_server PRIVATE OpureVoxelEngine opure_warnings)
+target_link_libraries(opure_server PRIVATE OpureVoxelEngine opure_warnings ws2_32)

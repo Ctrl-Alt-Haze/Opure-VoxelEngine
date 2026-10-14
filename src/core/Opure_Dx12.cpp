@@ -185,6 +185,7 @@ void Device::Initialize()
     }
 
     g_adapterName  = WideToUtf8(bestDesc.Description);
+    g_dedicatedVram = bestMem;
     dedicatedVram_ = bestMem;
 
     ID3D12Device* rawDev = nullptr;

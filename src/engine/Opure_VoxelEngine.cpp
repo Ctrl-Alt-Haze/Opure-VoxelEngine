@@ -919,6 +919,7 @@ GenerateResult VoxelEngine::Generate(const std::vector<uint32_t>& tokens,
     const uint32_t budget = std::min(opts.maxNewTokens, opts_.maxNewTokens);
     const uint32_t maxPos  = graph_.Config().maxPositions;
 
+    uint64_t decodeUs = 0;   // decode time only; prefill is reported separately
     for (uint32_t i = 0; i < budget; ++i)
     {
         r.generated.push_back(next);
@@ -934,8 +935,25 @@ GenerateResult VoxelEngine::Generate(const std::vector<uint32_t>& tokens,
         next = DecodeStep(next, seqLen_);
         uint64_t stepEnd = std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
+        decodeUs += (stepEnd - stepStart);
         lastTokenTimeMs_ = static_cast<uint64_t>((stepEnd - stepStart) / 1000.0f);
     }
+
+    // Populate the timing fields rather than leaving them at 0.0. These used to
+    // be declared and never written, so every caller reporting "0 ms/token"
+    // was reading an uninitialised field, not a fast decode.
+    //
+    // msPerToken excludes prefill on purpose. Prefill is O(prompt) and happens
+    // once; folding it into a per-token average makes the number describe
+    // something the caller never asked about. prefill_ms is not reported here
+    // because GenerateResult has no field for it and inventing one is a wider
+    // change than this fix warrants.
+    r.lastMs = static_cast<double>(lastTokenTimeMs_);
+    const size_t decoded = r.generated.empty() ? 0 : r.generated.size();
+    r.msPerToken = decoded > 0
+        ? (static_cast<double>(decodeUs) / 1000.0 / static_cast<double>(decoded))
+        : 0.0;
+
     return r;
 }
 
