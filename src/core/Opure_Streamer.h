@@ -69,6 +69,8 @@ struct Tensor
     std::vector<int64_t> shape;      // row-major, as stored
     uint64_t             byteBegin = 0;   // absolute, into the mapped file
     uint64_t             byteEnd   = 0;   // absolute, one past the last byte
+    // Scale factor for quantized tensors (INT8/INT4). Default 1.0 for F32/F16/BF16.
+    float                scale = 1.0f;
 
     [[nodiscard]] uint64_t ElementCount() const;
     [[nodiscard]] uint64_t ByteCount()  const { return byteEnd - byteBegin; }

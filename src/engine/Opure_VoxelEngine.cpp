@@ -197,6 +197,14 @@ void VoxelEngine::RecordForward(const uint32_t tokenId, const uint32_t position,
     const uint32_t epsBits  = cfg.rmsNormEpsBits;
     const uint32_t thetaBits = graph::ModelConfig::FloatBits(static_cast<float>(cfg.ropeTheta));
 
+    // Activations are always fp32 in the activation banks -- only the weights
+    // are quantized -- so the quantized GEMV's activation scale is the identity
+    // 1.0f. It is still passed explicitly rather than left as a literal 0,
+    // because AsF(0) is 0.0f and the kernel multiplies by it: a 0 here silently
+    // returns an all-zero row. Weight scales likewise travel as float bits, not
+    // as truncated integers.
+    constexpr uint32_t kQuantActScale = graph::ModelConfig::FloatBits(1.0f);
+
     dispatches_ = 0;
 
     dx12::CommandScope cs(*dev_);
@@ -306,19 +314,52 @@ void VoxelEngine::RecordForward(const uint32_t tokenId, const uint32_t position,
         // the end of the input and write only min(d_in, d_out) outputs, which is
         // why the square-matrix parity test never caught it.
         {
-            const uint32_t p[7] = { 0, static_cast<uint32_t>(t.wq), scratchQ_,
-                                    h, h, LB.normed, LB.qkv };
-            if (GO(shaders::Id::GEMV, p, 7, h)) { return; }
+            const uint64_t wqOff = static_cast<uint64_t>(t.wq);
+            const bool wqQuant = graph_.IsQuantized(wqOff);
+            const uint32_t pGEMV[7] = { 0, static_cast<uint32_t>(t.wq), scratchQ_, h, h, LB.normed, LB.qkv };
+            const uint32_t pGEMVQuant[9] = { 0, static_cast<uint32_t>(t.wq), scratchQ_, h, h,
+                                             graph::ModelConfig::FloatBits(graph_.GetQuantizedScale(wqOff)),
+                                             kQuantActScale, LB.normed, LB.qkv };
+            if (wqQuant)
+            {
+                if (GO(shaders::Id::GEMVQuant, pGEMVQuant, 9, h)) { return; }
+            }
+            else
+            {
+                if (GO(shaders::Id::GEMV, pGEMV, 7, h)) { return; }
+            }
         }
         {
-            const uint32_t p[7] = { 0, static_cast<uint32_t>(t.wk), scratchK_,
-                                    h, kvHidden, LB.normed, LB.qkv };
-            if (GO(shaders::Id::GEMV, p, 7, kvHidden)) { return; }
+            const uint64_t wkOff = static_cast<uint64_t>(t.wk);
+            const bool wkQuant = graph_.IsQuantized(wkOff);
+            const uint32_t pGEMV[7] = { 0, static_cast<uint32_t>(t.wk), scratchK_, h, kvHidden, LB.normed, LB.qkv };
+            const uint32_t pGEMVQuant[9] = { 0, static_cast<uint32_t>(t.wk), scratchK_, h, kvHidden,
+                                             graph::ModelConfig::FloatBits(graph_.GetQuantizedScale(wkOff)),
+                                             kQuantActScale, LB.normed, LB.qkv };
+            if (wkQuant)
+            {
+                if (GO(shaders::Id::GEMVQuant, pGEMVQuant, 9, kvHidden)) { return; }
+            }
+            else
+            {
+                if (GO(shaders::Id::GEMV, pGEMV, 7, kvHidden)) { return; }
+            }
         }
         {
-            const uint32_t p[7] = { 0, static_cast<uint32_t>(t.wv), scratchV_,
-                                    h, kvHidden, LB.normed, LB.qkv };
-            if (GO(shaders::Id::GEMV, p, 7, kvHidden)) { return; }
+            const uint64_t wvOff = static_cast<uint64_t>(t.wv);
+            const bool wvQuant = graph_.IsQuantized(wvOff);
+            const uint32_t pGEMV[7] = { 0, static_cast<uint32_t>(t.wv), scratchV_, h, kvHidden, LB.normed, LB.qkv };
+            const uint32_t pGEMVQuant[9] = { 0, static_cast<uint32_t>(t.wv), scratchV_, h, kvHidden,
+                                             graph::ModelConfig::FloatBits(graph_.GetQuantizedScale(wvOff)),
+                                             kQuantActScale, LB.normed, LB.qkv };
+            if (wvQuant)
+            {
+                if (GO(shaders::Id::GEMVQuant, pGEMVQuant, 9, kvHidden)) { return; }
+            }
+            else
+            {
+                if (GO(shaders::Id::GEMV, pGEMV, 7, kvHidden)) { return; }
+            }
         }
 
         // RoPE: rotate q and k, and append K,V to the paged cache.
@@ -348,9 +389,20 @@ void VoxelEngine::RecordForward(const uint32_t tokenId, const uint32_t position,
 
         // o_proj: reads the attention output from LB.attn, writes LB.proj.
         {
-            const uint32_t p[7] = { scratchA_, static_cast<uint32_t>(t.wo), 0,
-                                    h, h, LB.attn, LB.proj };
-            if (GO(shaders::Id::GEMV, p, 7, h)) { return; }
+            const uint64_t woOff = static_cast<uint64_t>(t.wo);
+            const bool woQuant = graph_.IsQuantized(woOff);
+            const uint32_t pGEMV[7] = { scratchA_, static_cast<uint32_t>(t.wo), 0, h, h, LB.attn, LB.proj };
+            const uint32_t pGEMVQuant[9] = { scratchA_, static_cast<uint32_t>(t.wo), 0, h, h,
+                                             graph::ModelConfig::FloatBits(graph_.GetQuantizedScale(woOff)),
+                                             kQuantActScale, LB.attn, LB.proj };
+            if (woQuant)
+            {
+                if (GO(shaders::Id::GEMVQuant, pGEMVQuant, 9, h)) { return; }
+            }
+            else
+            {
+                if (GO(shaders::Id::GEMV, pGEMV, 7, h)) { return; }
+            }
         }
 
         // Residual: x(OLD rb) + proj(LB.proj) -> LB.rb1.
@@ -374,14 +426,36 @@ void VoxelEngine::RecordForward(const uint32_t tokenId, const uint32_t position,
             if (GO(shaders::Id::RMSNorm, p, 8, 1)) { return; }
         }
         {
-            const uint32_t p[7] = { 0, static_cast<uint32_t>(t.gate), scratchG_,
-                                    h, ff, LB.n2, LB.gu };
-            if (GO(shaders::Id::GEMV, p, 7, ff)) { return; }
+            const uint64_t gateOff = static_cast<uint64_t>(t.gate);
+            const bool gateQuant = graph_.IsQuantized(gateOff);
+            const uint32_t pGEMV[7] = { 0, static_cast<uint32_t>(t.gate), scratchG_, h, ff, LB.n2, LB.gu };
+            const uint32_t pGEMVQuant[9] = { 0, static_cast<uint32_t>(t.gate), scratchG_, h, ff,
+                                             graph::ModelConfig::FloatBits(graph_.GetQuantizedScale(gateOff)),
+                                             kQuantActScale, LB.n2, LB.gu };
+            if (gateQuant)
+            {
+                if (GO(shaders::Id::GEMVQuant, pGEMVQuant, 9, ff)) { return; }
+            }
+            else
+            {
+                if (GO(shaders::Id::GEMV, pGEMV, 7, ff)) { return; }
+            }
         }
         {
-            const uint32_t p[7] = { 0, static_cast<uint32_t>(t.up), scratchU_,
-                                    h, ff, LB.n2, LB.gu };
-            if (GO(shaders::Id::GEMV, p, 7, ff)) { return; }
+            const uint64_t upOff = static_cast<uint64_t>(t.up);
+            const bool upQuant = graph_.IsQuantized(upOff);
+            const uint32_t pGEMV[7] = { 0, static_cast<uint32_t>(t.up), scratchU_, h, ff, LB.n2, LB.gu };
+            const uint32_t pGEMVQuant[9] = { 0, static_cast<uint32_t>(t.up), scratchU_, h, ff,
+                                             graph::ModelConfig::FloatBits(graph_.GetQuantizedScale(upOff)),
+                                             kQuantActScale, LB.n2, LB.gu };
+            if (upQuant)
+            {
+                if (GO(shaders::Id::GEMVQuant, pGEMVQuant, 9, ff)) { return; }
+            }
+            else
+            {
+                if (GO(shaders::Id::GEMV, pGEMV, 7, ff)) { return; }
+            }
         }
 
         // SwiGLU: reads LB.gu, writes LB.hh.
@@ -393,9 +467,20 @@ void VoxelEngine::RecordForward(const uint32_t tokenId, const uint32_t position,
         // down_proj: contracts the intermediate size, so inDim = ff and
         // outDim = h -- the opposite of gate/up.
         {
-            const uint32_t p[7] = { scratchH_, static_cast<uint32_t>(t.down), scratchA_,
-                                    ff, h, LB.hh, LB.down };
-            if (GO(shaders::Id::GEMV, p, 7, h)) { return; }
+            const uint64_t downOff = static_cast<uint64_t>(t.down);
+            const bool downQuant = graph_.IsQuantized(downOff);
+            const uint32_t pGEMV[7] = { scratchH_, static_cast<uint32_t>(t.down), scratchA_, ff, h, LB.hh, LB.down };
+            const uint32_t pGEMVQuant[9] = { scratchH_, static_cast<uint32_t>(t.down), scratchA_, ff, h,
+                                             graph::ModelConfig::FloatBits(graph_.GetQuantizedScale(downOff)),
+                                             kQuantActScale, LB.hh, LB.down };
+            if (downQuant)
+            {
+                if (GO(shaders::Id::GEMVQuant, pGEMVQuant, 9, h)) { return; }
+            }
+            else
+            {
+                if (GO(shaders::Id::GEMV, pGEMV, 7, h)) { return; }
+            }
         }
 
         // Residual: x(LB.rb1) + down(LB.down) -> LB.rb2. Same capture-before-advance

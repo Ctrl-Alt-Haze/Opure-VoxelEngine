@@ -22,6 +22,9 @@
 // ============================================================================
 #pragma once
 
+#include <bit>
+#include <unordered_map>
+
 #include "core/Opure_Platform.h"
 #include "core/Opure_Streamer.h"
 #include "engine/Opure_ModelSpec.h"
@@ -94,7 +97,9 @@ struct ModelConfig
     static ModelConfig Parse(std::string_view jsonText);
 
     // Float bit pattern of a float, for passing eps through the parameter block.
-    static uint32_t FloatBits(float f);
+    // constexpr so callers can bake compile-time constants (e.g. a scale of 1.0f)
+    // into static parameter arrays instead of computing them per dispatch.
+    static constexpr uint32_t FloatBits(float f) { return std::bit_cast<uint32_t>(f); }
 };
 
 // ---------------------------------------------------------------------------
@@ -126,6 +131,11 @@ struct VramPlan
     // The LM head. Equal to embedTokens for tied-embedding models, which is the
     // common case and costs no extra VRAM.
     uint64_t lmHead      = 0;   // [vocab, hidden]
+
+    // Scale factors for quantized weights (one float per quantized tensor).
+    // Stored after the weight buffer.
+    uint64_t scaleWords  = 0;
+    uint64_t scaleBytes  = 0;
 
     // Activation scratch. Three banks of this size (A, B and the residual bank C);
     // see ModelConfig::TotalVramBytes for why three are required.
@@ -184,6 +194,20 @@ public:
     // harness to read back what was actually uploaded.
     [[nodiscard]] uint64_t EmbedTokensWord() const { return plan_.embedTokens; }
 
+    // Check if a tensor at the given word offset is quantized, and get its scale factor.
+    //
+    // GetQuantizedScale deliberately does NOT throw when the offset is absent.
+    // RecordForward builds the 9-parameter quantized array for every GEMV site
+    // eagerly, before branching on IsQuantized, so a strict .at() would throw
+    // on the F32 tensors that the engine is running today. The returned 1.0f is
+    // never consumed: the dispatch that reads P[5]/P[6] is only submitted on the
+    // IsQuantized() branch.
+    [[nodiscard]] bool IsQuantized(uint64_t wordOffset) const { return quantizedScales_.contains(wordOffset); }
+    [[nodiscard]] float GetQuantizedScale(uint64_t wordOffset) const {
+        const auto it = quantizedScales_.find(wordOffset);
+        return it == quantizedScales_.end() ? 1.0f : it->second;
+    }
+
     // Which attention entry point to use for this model's head_dim. Throws if
     // head_dim is neither 64 nor 128, because no such pipeline exists.
     enum class AttEntry : uint8_t
@@ -203,6 +227,9 @@ private:
     ModelSpec        spec_;
     safetensors::WeightStreamer stream_;
     bool             loaded_ = false;
+
+    // Quantized tensor info: word offset -> scale factor
+    std::unordered_map<uint64_t, float> quantizedScales_;
 };
 
 // Small file helpers exposed for tooling.

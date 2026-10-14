@@ -68,12 +68,7 @@ constexpr uint64_t kArgmaxTailWords = 2;
 } // namespace
 
 // ---------------------------------------------------------------------------
-uint32_t ModelConfig::FloatBits(float f)
-{
-    uint32_t u;
-    std::memcpy(&u, &f, 4);
-    return u;
-}
+// FloatBits is defined inline and constexpr in the header; nothing to do here.
 
 // ---------------------------------------------------------------------------
 ModelConfig ModelConfig::Parse(std::string_view jsonText)
@@ -321,11 +316,12 @@ void Graph::PlanLayout()
     auto place = [&](const safetensors::Tensor& t) -> uint64_t
     {
         const uint64_t at = cursor;
-        // The resident format is always F32, so every tensor occupies four bytes
-        // per element regardless of how the file stores it; a BF16 source is
-        // widened on the host at upload time. 256-byte alignment keeps every row
-        // of a GEMV 64-byte-segment friendly.
-        cursor += Align64(t.ElementCount() * 4, 256);
+        // The resident format depends on dtype:
+        // - F32/F16/BF16: 4 bytes per element (widened to F32)
+        // - I8/U8: 1 byte per element (stored as packed bytes, 4 per word)
+        // - I4/U4: 1 byte per element (2 elements per byte, widened to F32 on load)
+        uint32_t elementBytes = safetensors::ElementBytes(t.dtype);
+        cursor += Align64(t.ElementCount() * elementBytes, 256);
         return at / 4;   // word offset
     };
 
@@ -364,7 +360,16 @@ void Graph::PlanLayout()
     }
 
     plan_.weightWords = cursor;
-    plan_.weightBytes = cursor * 4;
+    plan_.weightBytes = cursor * 4;  // weight buffer is always addressed in words
+
+    // Scale factors for quantized tensors (one float per quantized tensor)
+    uint64_t scaleCount = 0;
+    for (const auto& r : spec_.ReadSet())
+    {
+        if (r->IsQuantized()) { ++scaleCount; }
+    }
+    plan_.scaleWords = scaleCount;
+    plan_.scaleBytes = scaleCount * 4;  // one float per quantized tensor
 
     // Plasticity staging. The SignSGD pass may not read O_W and write O_WU in
     // one dispatch (D3D12 leaves that aliasing undefined), so the updated matrix
@@ -425,23 +430,10 @@ Graph::AttEntry Graph::AttentionEntryPoint() const
 
 // Copies every weight into the GPU weight buffer in planned order.
 //
-// The source is the memory-mapped file itself, so nothing is staged on the host
-// beyond the upload buffer inside Device::UploadRanges. One command list per
-// 32 MB batch, not one per tensor.
+// Quantized tensors (I8/U8/I4/U4) are uploaded as-is without widening.
+// Their scale factors are stored in a separate scale buffer.
 void Graph::UploadWeights(dx12::Device& dev, dx12::GpuBuffer& weights)
 {
-    // Two paths, because the resident format is always F32 but the file usually
-    // is not.
-    //
-    //   F32  -> zero-copy: hand the mapping's bytes straight to the uploader.
-    //   other -> widen on the host into ONE staging buffer, then upload ranges
-    //            into it. A per-tensor temporary would alias, since every
-    //            converted range would point at the same reused allocation.
-    //
-    // The previous code copied bytes verbatim regardless of dtype, so a BF16
-    // model -- which is what nearly every real checkpoint ships -- would have put
-    // 2-byte payloads into 4-byte slots and produced a model that loaded cleanly
-    // and computed nonsense.
     struct Piece { uint64_t wordOffset; const TensorRef* ref; };
 
     std::vector<Piece> pieces;
@@ -469,16 +461,18 @@ void Graph::UploadWeights(dx12::Device& dev, dx12::GpuBuffer& weights)
         pieces.push_back({ t.down, &b.down });
     }
 
-    // ---- pass 1: raw F32 ranges -------------------------------------------
+    // ---- pass 1: F32 and quantized tensors (uploaded as-is) ---------------
     std::vector<dx12::Device::UploadRange> ranges;
-    ranges.reserve(pieces.size());
+    ranges.reserve(pieces.size() + pieces.size() / 2);  // + scale factors
 
-    // ---- pass 2 staging layout (allocated only if something needs widening)
+    // ---- pass 2 staging layout (for non-F32, non-quantized: BF16/F16) -------
     std::vector<uint64_t> stageOffset(pieces.size(), 0);
     uint64_t stageWords = 0;
     for (size_t i = 0; i < pieces.size(); ++i)
     {
-        if (pieces[i].ref->dtype == safetensors::Dtype::F32) { continue; }
+        auto dt = pieces[i].ref->dtype;
+        if (dt == safetensors::Dtype::F32 || dt == safetensors::Dtype::I8 || dt == safetensors::Dtype::U8 ||
+            dt == safetensors::Dtype::I4 || dt == safetensors::Dtype::U4) { continue; }
         stageOffset[i] = stageWords;
         stageWords += pieces[i].ref->Elements();
     }
@@ -489,6 +483,10 @@ void Graph::UploadWeights(dx12::Device& dev, dx12::GpuBuffer& weights)
         staging.resize(static_cast<size_t>(stageWords));
     }
 
+    // Scale factors are stored after the weight buffer
+    std::vector<float> scales;
+    scales.reserve(plan_.scaleWords);
+
     for (size_t i = 0; i < pieces.size(); ++i)
     {
         const TensorRef& r = *pieces[i].ref;
@@ -496,15 +494,36 @@ void Graph::UploadWeights(dx12::Device& dev, dx12::GpuBuffer& weights)
 
         if (r.dtype == safetensors::Dtype::F32)
         {
+            // F32: zero-copy
             ranges.push_back({ stream_.Data(t), t.ByteCount(), pieces[i].wordOffset * 4 });
+        }
+        else if (r.dtype == safetensors::Dtype::I8 || r.dtype == safetensors::Dtype::U8 ||
+                 r.dtype == safetensors::Dtype::I4 || r.dtype == safetensors::Dtype::U4)
+        {
+            // Quantized: upload raw bytes, store scale factor
+            uint64_t elementBytes = safetensors::ElementBytes(r.dtype);
+            ranges.push_back({ stream_.Data(t), r.Elements() * elementBytes, pieces[i].wordOffset * elementBytes });
+            scales.push_back(r.scale);
+            quantizedScales_[pieces[i].wordOffset] = r.scale;
         }
         else
         {
+            // BF16/F16: widen to F32 on host
             safetensors::WidenToF32(r.dtype, stream_.Data(t), r.Elements(),
                                     staging.data() + stageOffset[i]);
             ranges.push_back({ staging.data() + stageOffset[i],
                                r.Elements() * 4,
                                pieces[i].wordOffset * 4 });
+        }
+    }
+
+    // Append scale factors after the weight data
+    if (!scales.empty())
+    {
+        uint64_t scaleWordOffset = plan_.weightWords + plan_.scaleWords - scales.size();
+        for (float s : scales)
+        {
+            ranges.push_back({ &s, 4, scaleWordOffset++ * 4 });
         }
     }
 

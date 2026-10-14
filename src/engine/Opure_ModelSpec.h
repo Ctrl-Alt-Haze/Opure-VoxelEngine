@@ -59,9 +59,13 @@ struct TensorRef
     std::string              name;       // empty when absent
     safetensors::Dtype       dtype  = safetensors::Dtype::F32;
     std::vector<int64_t>     shape;      // as stored in the file
+    // Scale factor for quantized tensors (INT8/INT4). For F32/F16/BF16, this is 1.0f.
+    // The quantized GEMV kernel computes: output = scale_w * scale_x * sum(weight_q * x)
+    float                      scale = 1.0f;
     [[nodiscard]] bool  Present()  const { return !name.empty(); }
     [[nodiscard]] uint64_t Elements() const;
     [[nodiscard]] bool  Matches(std::initializer_list<int64_t> dims) const;
+    [[nodiscard]] bool  IsQuantized() const { return dtype == safetensors::Dtype::I8 || dtype == safetensors::Dtype::U8 || dtype == safetensors::Dtype::I4 || dtype == safetensors::Dtype::U4; }
 };
 
 // ---------------------------------------------------------------------------
@@ -78,6 +82,9 @@ struct BlockTensors
     TensorRef gate;           // [ff,       hidden]
     TensorRef up;             // [ff,       hidden]
     TensorRef down;           // [hidden,   ff]
+
+    // For quantized tensors, the scale factor is stored in the TensorRef::scale field.
+    // No additional fields needed here.
 };
 
 // ---------------------------------------------------------------------------

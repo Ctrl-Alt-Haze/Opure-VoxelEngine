@@ -272,6 +272,15 @@ void WeightStreamer::ParseHeader(const uint8_t* header, uint64_t headerLen)
         t.name = name;
         t.dtype = ParseDtype(v.At("dtype", name).str);
 
+        // Parse scale factor for quantized tensors (default 1.0)
+        if (v.IsObject())
+        {
+            if (const json::Value* scaleVal = v.Find("scale"); scaleVal && scaleVal->IsNumber())
+            {
+                t.scale = static_cast<float>(scaleVal->num);
+            }
+        }
+
         const json::Value& shape = v.At("shape", name);
         OPURE_CHECK(shape.IsArray(), "tensor '" + name + "' has a non-array shape");
         t.shape.reserve(shape.arr.size());

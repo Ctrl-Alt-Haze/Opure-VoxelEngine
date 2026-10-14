@@ -87,58 +87,61 @@ void ModelSpec::Require(const TensorRef& t, const char* role,
 // ---------------------------------------------------------------------------
 namespace
 {
-    TensorRef Make(const safetensors::WeightStreamer& s, std::string_view name)
-    {
-        const safetensors::Tensor* t = s.TryFind(name);
-        if (t == nullptr) { return TensorRef{}; }
-        TensorRef r;
-        r.name  = t->name;
-        r.dtype = t->dtype;
-        r.shape = t->shape;
-        return r;
-    }
 
-    // Probes a list of candidate names and returns the first that exists.
-    // The first entry is the canonical Hugging Face llama name; the rest cover
-    // the other conventions seen in the wild.
-    TensorRef Probe(const safetensors::WeightStreamer& s,
-                    const std::vector<std::string>& candidates)
-    {
-        for (const std::string& c : candidates)
-        {
-            TensorRef r = Make(s, c);
-            if (r.Present()) { return r; }
-        }
-        return TensorRef{};
-    }
-
-    // Chooses the per-block prefix by testing layer 0's query projection. Every
-    // convention shares the same query-projection role within a block, so one
-    // probe identifies all of them.
-    //
-    // The returned prefix deliberately STOPS BEFORE the "0." -- callers build a
-    // concrete name as prefix + layerIndex + "." + role, so leaving the 0 in
-    // would produce "model.layers.0.0.self_attn...".
-    std::string DetectLayerPrefix(const safetensors::WeightStreamer& s)
-    {
-        static const char* kCandidates[] = {
-            "model.layers.0.self_attn.q_proj.weight",
-            "model.layers.0.attention.wq.weight",
-            "transformer.h.0.attn.c_attn.wq.weight",
-            "model.decoder.layers.0.self_attn.q_proj.weight",
-            "gpt_neox.layers.0.attention.query_key_value.weight",
-        };
-        for (const char* c : kCandidates)
-        {
-            if (s.TryFind(c) != nullptr)
-            {
-                const std::string full(c);
-                return full.substr(0, full.find("0."));
-            }
-        }
-        return "model.layers.";
-    }
+TensorRef Make(const safetensors::WeightStreamer& s, std::string_view name)
+{
+    const safetensors::Tensor* t = s.TryFind(name);
+    if (t == nullptr) { return TensorRef{}; }
+    TensorRef r;
+    r.name  = t->name;
+    r.dtype = t->dtype;
+    r.shape = t->shape;
+    r.scale = t->scale;
+    return r;
 }
+
+// Probes a list of candidate names and returns the first that exists.
+// The first entry is the canonical Hugging Face llama name; the rest cover
+// the other conventions seen in the wild.
+TensorRef Probe(const safetensors::WeightStreamer& s,
+                const std::vector<std::string>& candidates)
+{
+    for (const std::string& c : candidates)
+    {
+        TensorRef r = Make(s, c);
+        if (r.Present()) { return r; }
+    }
+    return TensorRef{};
+}
+
+// Chooses the per-block prefix by testing layer 0's query projection. Every
+// convention shares the same query-projection role within a block, so one
+// probe identifies all of them.
+//
+// The returned prefix deliberately STOPS BEFORE the "0." -- callers build a
+// concrete name as prefix + layerIndex + "." + role, so leaving the 0 in
+// would produce "model.layers.0.0.self_attn...".
+std::string DetectLayerPrefix(const safetensors::WeightStreamer& s)
+{
+    static const char* kCandidates[] = {
+        "model.layers.0.self_attn.q_proj.weight",
+        "model.layers.0.attention.wq.weight",
+        "transformer.h.0.attn.c_attn.wq.weight",
+        "model.decoder.layers.0.self_attn.q_proj.weight",
+        "gpt_neox.layers.0.attention.query_key_value.weight",
+    };
+    for (const char* c : kCandidates)
+    {
+        if (s.TryFind(c) != nullptr)
+        {
+            const std::string full(c);
+            return full.substr(0, full.find("0."));
+        }
+    }
+    return "model.layers.";
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 void ModelSpec::Resolve(const ModelConfig& cfg,
@@ -296,6 +299,7 @@ void ModelSpec::Check(const ModelConfig& cfg)
         {
             Require(t, (at + r).c_str(), dims);
         };
+
         req(b.inputNorm,   "input_layernorm",   { static_cast<int64_t>(h) });
         req(b.postAttNorm, "post_attn_layernorm", { static_cast<int64_t>(h) });
         req(b.wq, "q_proj", { static_cast<int64_t>(h),     static_cast<int64_t>(h) });
@@ -308,7 +312,6 @@ void ModelSpec::Check(const ModelConfig& cfg)
     }
 }
 
-// ---------------------------------------------------------------------------
 void ModelSpec::RebuildReadSet()
 {
     readSet_.clear();
