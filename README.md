@@ -312,12 +312,14 @@ GEMV, dequant-on-upload, and INT4 safetensors loading** — no new hardware need
 
 | Item | Status |
 |---|---|
-| INT4/INT8 dequant-on-upload | 🔧 In progress |
-| `Opure_GEMV_Quant` kernel wired | 🔧 In progress |
-| INT4 safetensors loader | 🔧 In progress |
-| 7B/8B/13B INT4 model support | 🎯 Next |
-| Sliding-window KV cache | ⏳ Planned |
-| Speculative decode integration | ✅ Kernel ready |
+| INT4/INT8 dtype, `Tensor::scale`, sign-extending nibble unpack | ✅ Done |
+| BF16/F16 → F32 widening on upload, F32 stays zero-copy | ✅ Done |
+| `Opure_GEMV_Quant` kernel wired at all 7 GEMV sites | ✅ Done |
+| INT4 safetensors loader + per-tensor scale in `VramPlan` | ✅ Done |
+| Quantized dispatch covered by a parity gate | ✅ Done |
+| 7B/8B/13B INT4 model support | 🎯 Next — needs a real INT4 checkpoint |
+| Sliding-window KV cache (`Opure_Memmove`) | ✅ Done |
+| Speculative decode | ⚠️ 8 kernels compile, **nothing calls them yet** |
 
 ---
 
@@ -354,6 +356,38 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch_model.ps1
 
 ---
 
+## Running it
+
+```powershell
+# TUI -- streams tokens with a live tok/s readout
+.\build\Release\opure_chat.exe --model .\models
+
+# HTTP server -- the endpoint the UE5 plugin targets
+.\build\Release\opure_server.exe --port 8080 --model .\models
+```
+
+```powershell
+# health: geometry and the VRAM budget actually admitted against
+Invoke-RestMethod http://127.0.0.1:8080/health
+
+# generate
+Invoke-RestMethod http://127.0.0.1:8080/generate -Method POST `
+  -ContentType 'application/json' `
+  -Body '{"prompt":"The capital of France is","max_tokens":32}'
+
+# the self-monitoring snapshot from the last request
+Invoke-RestMethod http://127.0.0.1:8080/metrics
+```
+
+Measured on an RTX 5070 Ti with SmolLM-135M: **228.7 tok/s** over HTTP
+(4.37 ms/token, decode only — prefill excluded), 2153 MiB of 15995 MiB VRAM.
+
+The server binds loopback only. It is not hardened for exposure: no TLS, no
+authentication, no request rate limiting, and `max_tokens` is the only bound on
+a single request's cost.
+
+---
+
 ## Not yet implemented
 
 - **Unreal Engine integration.** `ue5/OpureVoxelEngine.Build.cs` is authored but
@@ -363,7 +397,20 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\fetch_model.ps1
 - **Multi-token prefill batching.** Prefill is chunked to respect the parameter
   slot budget, but every token is still computed by its own full 30-layer pass.
   A real GEMM prefill would collapse that into a handful of batched launches.
-- **KV cache eviction.** The cache is sized for `max_position_embeddings` and
-  never trimmed; a conversation longer than the window will not fit.
-- **INT8 / INT4 GEMV is compiled but not wired in.** `Opure_GEMV_Quant.usf` has
-  no per-dispatch caller, and the weight buffer is laid out for F32.
+- **KV cache eviction.** The sliding window now memmoves K and V out of the way
+  at capacity (`Opure_Memmove`), but eviction is unconditional: a model with a
+  shorter real attention window than `max_position_embeddings` should mask the
+  tail instead of shifting it.
+- **INT8 / INT4 GEMV is wired but unexercised end to end.** All seven dispatch
+  sites select the quantized kernel and the kernel has a parity gate, but no
+  INT4 checkpoint exists on this machine, so the loader has never read a real
+  packed-int4 safetensors file. The scale is carried as a per-tensor float and
+  the activation scale is the identity 1.0f (activations stay fp32) — both are
+  asserted by `TestGEMVQuant`.
+- **Speculative decode is compiled but dead.** `Opure_SpeculativeDecode.usf`
+  builds 8 verification kernels and `SpecVerifyFor()` selects between them, but
+  no code path submits them. `speculativeAcceptance` reports -1, meaning
+  "unavailable", not 0.
+- **The HTTP server is single-threaded.** One request is served to completion
+  before the next is accepted. That keeps command lists serialised on the one
+  device; concurrent clients need multiple engines, not threads.
