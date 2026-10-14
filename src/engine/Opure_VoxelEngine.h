@@ -203,6 +203,23 @@ public:
     // Reduces logits already present in `logitBank` to their argmax token id.
     uint32_t ArgMaxFrom(uint32_t logitBank);
 
+    // Reads the full logit vector out of `logitBank` and refreshes
+    // lastLogitEntropy_ / lastLogitNorm_.
+    //
+    // Deliberately NOT folded into DecodeStep. It costs a vocabSize*4 byte
+    // readback (196 KB on SmolLM), and DecodeStep is on the per-token critical
+    // path -- charging every token for a metric nobody asked for would show up
+    // directly in tokens/sec. Callers that want the numbers ask for them.
+    void RefreshLogitStats(uint32_t logitBank);
+
+    // Bank holding the logits from the most recent forward pass, or 0 if none.
+    [[nodiscard]] uint32_t LastLogitBank() const { return lastLogitBank_; }
+
+    // Statistics derived by RefreshLogitStats. Both are -1.0f until that has
+    // run at least once, so "not measured" is distinct from a real zero.
+    [[nodiscard]] float LastLogitEntropy() const { return lastLogitEntropy_; }
+    [[nodiscard]] float LastLogitNorm() const { return lastLogitNorm_; }
+
     // Records the embedding and the first `nLayers` layers, then reads the
     // residual stream back. Used by the harness to find the first layer where
     // the GPU graph and the CPU reference disagree.
@@ -254,9 +271,12 @@ private:
 
     // Self-monitoring state (friend MetricsCollector for access).
     uint64_t               lastTokenTimeMs_ = 0;
-    float                  lastLogitEntropy_ = 0.0f;
-    float                  lastLogitNorm_ = 0.0f;
-    float                  lastMaxAttnScore_ = 0.0f;
+    float                  lastLogitEntropy_ = -1.0f;
+    float                  lastLogitNorm_ = -1.0f;
+    float                  lastMaxAttnScore_ = -1.0f;
+
+    // Bank the most recent forward pass left its logits in.
+    uint32_t               lastLogitBank_ = 0;
 
     // KV cache bookkeeping. seqLen_ counts tokens written so far.
     uint32_t               seqLen_ = 0;

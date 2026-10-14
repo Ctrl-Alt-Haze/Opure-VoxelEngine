@@ -634,6 +634,69 @@ void TestModelForward(Device& dev, shaders::Library& lib, Gpu& gpu)
     std::printf("  %-26s PASS  deviceRemovedReason = 0x%08X\n",
                 "forward pass", static_cast<unsigned>(dev.Get()->GetDeviceRemovedReason()));
 
+    // ---- self-monitoring statistics ---------------------------------------
+    //
+    // RefreshLogitStats used to return a hardcoded 0.0f for both entropy and
+    // norm, which reads as "perfectly confident, no distribution shift" -- the
+    // most reassuring possible lie for an out-of-distribution detector. It now
+    // derives both from the real logit vector.
+    //
+    // This has to run HERE, immediately after the forward pass. Everything
+    // further down poisons the activation banks with a known sentinel, so by
+    // the time the parity comparison runs, the logits are long gone and this
+    // check would be reading the poison instead. (It did, on the first
+    // attempt: 1234.5 * sqrt(49152) came back as the reported norm.)
+    //
+    // The reference is computed from gpuLogits -- what the GPU actually
+    // produced -- not from the CPU model. This asserts the statistic; the
+    // forward pass itself is covered by the parity gate further down.
+    {
+        double sumSq = 0.0;
+        float mx = gpuLogits[0];
+        for (float g : gpuLogits)
+        {
+            sumSq += static_cast<double>(g) * static_cast<double>(g);
+            if (g > mx) mx = g;
+        }
+        const double refNorm = std::sqrt(sumSq);
+
+        double sumExp = 0.0;
+        for (float g : gpuLogits)
+            sumExp += std::exp(static_cast<double>(g - mx));
+        double refEntropy = 0.0;
+        if (sumExp > 0.0)
+        {
+            const double inv = 1.0 / sumExp;
+            for (float g : gpuLogits)
+            {
+                const double p = std::exp(static_cast<double>(g - mx)) * inv;
+                if (p > 0.0) refEntropy -= p * std::log(p);
+            }
+        }
+
+        eng.RefreshLogitStats(eng.LastLogitBank());
+
+        const float gotNorm   = eng.LastLogitNorm();
+        const float gotEnt    = eng.LastLogitEntropy();
+        const float dNorm     = std::fabs(gotNorm - static_cast<float>(refNorm));
+        const float dEntropy  = std::fabs(gotEnt - static_cast<float>(refEntropy));
+
+        std::printf("  %-26s        ref=%.4f got=%.4f\n", "logit norm",
+                    static_cast<float>(refNorm), gotNorm);
+        std::printf("  %-26s        ref=%.4f got=%.4f\n", "logit entropy (nats)",
+                    static_cast<float>(refEntropy), gotEnt);
+
+        // Entropy is bounded above by ln(vocab) -- a uniform distribution. A
+        // value outside that range means the softmax is wrong, so assert the
+        // bound as well as agreement with the reference.
+        const float maxEntropy = std::log(static_cast<float>(gpuLogits.size()));
+        const bool normOk = dNorm <= 1e-2f * std::max(1.0f, static_cast<float>(refNorm));
+        const bool entOk  = dEntropy <= 1e-3f && gotEnt >= 0.0f && gotEnt <= maxEntropy;
+
+        Report("logit norm",    Result{ normOk, dNorm,    dNorm    }, 1e-2);
+        Report("logit entropy", Result{ entOk,  dEntropy, dEntropy }, 1e-3);
+    }
+
     // Trace: report the first few logits and whether the bank is non-zero.
     // A uniformly zero vector means a pass in the chain wrote nothing; a
     // plausible-but-wrong vector means the graph is mis-sequenced.

@@ -121,22 +121,30 @@ class VoxelEngine;  // forward decl
 class MetricsCollector
 {
 public:
-    explicit MetricsCollector(const VoxelEngine& engine);
+    explicit MetricsCollector(VoxelEngine& engine);
 
     // Takes a snapshot after a token is generated.
     MetricsSnapshot Snapshot();
 
-    // Computes logit entropy from the last forward pass's logits.
-    float ComputeLogitEntropy() const;
+    // Recomputes entropy and L2 norm from the last forward pass's logits,
+    // reading the vector back if the engine has not done so already. Returns
+    // -1.0f when no forward pass has run yet, so "unknown" is distinguishable
+    // from a genuine 0.0 (a perfectly peaked distribution still has entropy
+    // slightly above zero).
+    float ComputeLogitEntropy();
+    float ComputeLogitNorm();
 
-    // Computes logit L2 norm.
-    float ComputeLogitNorm() const;
-
-    // Computes max attention score from the last attention pass.
+    // Maximum attention weight in the last attention pass.
+    //
+    // Always -1.0f: the flash-decode kernel reduces over keys in registers and
+    // never writes the weight matrix out, so there is nothing on the GPU to
+    // read. Retaining it would cost a vocab-length score buffer per layer.
+    // Reported as unavailable rather than 0.0, which would read as "attention
+    // is uniformly diffuse" -- the opposite of the usual sign.
     float ComputeMaxAttnScore() const;
 
 private:
-    const VoxelEngine& engine_;
+    VoxelEngine& engine_;
     std::vector<float> layerTimings_;
     uint64_t lastTokenTimeMs_ = 0;
 };

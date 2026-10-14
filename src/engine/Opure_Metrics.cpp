@@ -21,7 +21,7 @@ namespace opure::engine {
 // ---------------------------------------------------------------------------
 //  MetricsCollector
 // ---------------------------------------------------------------------------
-MetricsCollector::MetricsCollector(const VoxelEngine& engine)
+MetricsCollector::MetricsCollector(VoxelEngine& engine)
     : engine_(engine)
 {
     layerTimings_.resize(engine_.GraphModel().Config().numLayers, 0.0f);
@@ -62,7 +62,9 @@ MetricsSnapshot MetricsCollector::Snapshot()
         ? static_cast<float>(plan.totalBytes) / plan.availableBytes
         : 0.0f;
 
-    // Speculative acceptance (placeholder -1 = disabled)
+    // Speculative acceptance. -1 means "no speculative decoder attached", which
+    // is the honest value: the SpeculativeVerify kernels compile but nothing
+    // calls them yet. 0.0 would read as "every draft token rejected".
     snap.speculativeAcceptance = -1.0f;
 
     // Max attention score
@@ -71,19 +73,23 @@ MetricsSnapshot MetricsCollector::Snapshot()
     return snap;
 }
 
-float MetricsCollector::ComputeLogitEntropy() const
+float MetricsCollector::ComputeLogitEntropy()
 {
-    // Get logits from the engine's last forward pass.
-    // The engine would need to expose the last logits buffer.
-    // For now, return a placeholder.
-    // Real implementation: engine_.GetLastLogits() -> span<float>
-    // H = -sum(p * log p) where p = softmax(logits)
+    // Real: reads the logit vector back and derives H = -sum(p log p) over the
+    // softmax. The readback is what makes this expensive, which is why the
+    // engine keeps it out of DecodeStep and the snapshot pays for it on demand.
+    if (engine_.LastLogitBank() != 0 || engine_.lastLogitEntropy_ < 0.0f)
+        engine_.RefreshLogitStats(engine_.LastLogitBank());
     return engine_.lastLogitEntropy_;
 }
 
-float MetricsCollector::ComputeLogitNorm() const
+float MetricsCollector::ComputeLogitNorm()
 {
     // L2 norm of logits vector. Distribution shift detection.
+    // RefreshLogitStats fills both this and entropy, so a snapshot costs one
+    // readback for both, not one each.
+    if (engine_.LastLogitBank() != 0 || engine_.lastLogitNorm_ < 0.0f)
+        engine_.RefreshLogitStats(engine_.LastLogitBank());
     return engine_.lastLogitNorm_;
 }
 

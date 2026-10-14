@@ -706,6 +706,7 @@ void VoxelEngine::Prefill(const std::vector<uint32_t>& tokens, uint32_t* logitBa
 
     seqLen_   = static_cast<uint32_t>(tokens.size());
     *logitBank = lb;
+    lastLogitBank_ = lb;
 }
 
 // ---------------------------------------------------------------------------
@@ -790,6 +791,7 @@ uint32_t VoxelEngine::DecodeStep(uint32_t tokenId, uint32_t position)
     }
     dev_->ExecuteAndWait();
     seqLen_ = position + 1;
+    lastLogitBank_ = lb;
 
     uint32_t result[2] = { 0, 0 };
     dev_->ReadbackFromBuffer(kv_, result, sizeof(result),
@@ -818,6 +820,62 @@ void VoxelEngine::ForwardLogits(const std::vector<uint32_t>& tokens,
                              static_cast<uint64_t>(scratchL_) * 4);
 }
 
+// ---------------------------------------------------------------------------
+//  Reads the full logit vector and derives the two statistics that the metrics
+//  layer reports. See RefreshLogitStats in the header for why this is not part
+//  of DecodeStep.
+//
+//  Entropy is in nats over the softmax, computed with the standard max-shift
+//  so exp() cannot overflow on a model whose logits run large. The shift does
+//  not change the distribution, only the numerical range.
+// ---------------------------------------------------------------------------
+void VoxelEngine::RefreshLogitStats(uint32_t logitBank)
+{
+    const graph::ModelConfig& cfg = graph_.Config();
+    const uint32_t vocab = cfg.vocabSize;
+    if (vocab == 0) return;
+
+    const dx12::GpuBuffer& bank =
+        (logitBank == kA) ? actA_ : ((logitBank == kB) ? actB_ : res_);
+
+    std::vector<float> logits(vocab, 0.0f);
+    dev_->ReadbackFromBuffer(bank, logits.data(),
+                             static_cast<uint64_t>(vocab) * 4,
+                             static_cast<uint64_t>(scratchL_) * 4);
+
+    // L2 norm: a scale-only statistic, so it is read straight off the raw
+    // logits before the softmax shift perturbs it.
+    double sumSq = 0.0;
+    float maxLogit = logits[0];
+    for (uint32_t i = 0; i < vocab; ++i)
+    {
+        sumSq += static_cast<double>(logits[i]) * static_cast<double>(logits[i]);
+        if (logits[i] > maxLogit) maxLogit = logits[i];
+    }
+    lastLogitNorm_ = static_cast<float>(std::sqrt(sumSq));
+
+    // Entropy of the softmax, accumulated in double so the tail terms do not
+    // drown in float rounding.
+    double sumExp = 0.0;
+    for (uint32_t i = 0; i < vocab; ++i)
+        sumExp += std::exp(static_cast<double>(logits[i] - maxLogit));
+
+    if (sumExp > 0.0)
+    {
+        const double invSum = 1.0 / sumExp;
+        double entropy = 0.0;
+        for (uint32_t i = 0; i < vocab; ++i)
+        {
+            const double p = std::exp(static_cast<double>(logits[i] - maxLogit)) * invSum;
+            if (p > 0.0) entropy -= p * std::log(p);
+        }
+        lastLogitEntropy_ = static_cast<float>(entropy);
+    }
+
+    lastLogitBank_ = logitBank;
+}
+
+// ---------------------------------------------------------------------------
 uint32_t VoxelEngine::ForwardArgMax(const std::vector<uint32_t>& tokens)
 {
     OPURE_CHECK(ready_, "engine used before Initialize");
