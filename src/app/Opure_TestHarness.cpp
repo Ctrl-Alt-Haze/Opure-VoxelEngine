@@ -1165,6 +1165,88 @@ void TestGEMV(Device& dev, shaders::Library& lib, Gpu& gpu)
     Report("GEMV  [64x128]", Compare(got, ref), 1e-4);
 }
 
+// ---- GEMVQuant: y[o] = scaleW * scaleX * sum_i int8W[o][i] * x[i] --------
+//
+// Phase 2's INT4/INT8 path has no model to run against yet, so this is the
+// only thing standing between the quantized dispatch and a silent zero. The
+// kernel and its 9-parameter layout were written without any test, and that is
+// exactly how P[6] ended up as a literal 0 -- AsF(0) is 0.0f, so the kernel
+// multiplied every row to zero and nothing complained. A test that feeds a
+// non-unit weight scale and asserts against a CPU reference catches that, and
+// catches a truncated scale the same way, because scaleW is passed as float
+// bits into a uint32_t[] and a raw float there would silently truncate to 0.
+//
+// int8 weights are packed four-per-word, little-endian, exactly as the GGUF
+// Q8_0-style packing the kernel expects: byte n of a word is element 4n.
+void TestGEMVQuant(Device& dev, shaders::Library& lib, Gpu& gpu)
+{
+    constexpr uint32_t kOut = 64, kIn = 128;   // kIn must be a multiple of 4
+    constexpr float    kScaleW = 0.0137f;      // deliberately not a round number
+    constexpr float    kScaleX = 1.0f;         // activations are fp32, so identity
+
+    Rng rng(0x9A17BEEFu);
+
+    // Quantize: pick int8 values directly rather than deriving them from floats,
+    // so the reference is exact and any error is the kernel's, not the quantizer's.
+    std::vector<int8_t>  q(kOut * kIn);
+    std::vector<uint32_t> W(kOut * kIn / 4, 0u);
+    for (size_t n = 0; n < q.size(); ++n)
+        q[n] = static_cast<int8_t>(static_cast<int>(rng.NextF() * 127.0f) - 63);
+
+    for (size_t n = 0; n < q.size(); ++n)
+    {
+        const uint32_t lane = static_cast<uint32_t>(n & 3u);
+        const uint32_t word = static_cast<uint32_t>(n >> 2);
+        const uint32_t byte = static_cast<uint32_t>(static_cast<uint8_t>(q[n]));
+        W[word] |= byte << (lane * 8);
+    }
+
+    std::vector<uint32_t> X(kIn);
+    for (auto& v : X) { const float f = rng.NextF() * 2.0f - 1.0f; std::memcpy(&v, &f, 4); }
+
+    Upload(dev, gpu.w, W);
+    Upload(dev, gpu.a, X);
+
+    // x from bank A, y to bank B: distinct resources, so no SRV/UAV aliasing.
+    const uint32_t p[9] = {
+        0, 0, 0,                              // xOff, wOff, yOff
+        kIn, kOut,                            // inDim, outDim
+        graph::ModelConfig::FloatBits(kScaleW),
+        graph::ModelConfig::FloatBits(kScaleX),
+        0, 1                                  // bank, obank
+    };
+    dev.ResetCommandList();
+    {
+        CommandScope cs(dev);
+        cs.SetPipeline(lib.Get(shaders::Id::GEMVQuant));
+        cs.SetParams(p, 9);
+        cs.Dispatch(kOut, 1, 1);
+    }
+    dev.ExecuteAndWait();
+
+    const F32 got = Download(dev, gpu.b, kOut);
+
+    F32 ref(kOut);
+    for (uint32_t o = 0; o < kOut; ++o)
+    {
+        float acc = 0.0f;
+        for (uint32_t i = 0; i < kIn; ++i)
+        {
+            float xf;
+            std::memcpy(&xf, &X[i], 4);
+            acc += static_cast<float>(q[o * kIn + i]) * xf;
+        }
+        ref[o] = acc * kScaleW * kScaleX;
+    }
+
+    std::printf("  %-26s        got[0..3]=%.5f %.5f %.5f %.5f\n", "",
+                got[0], got[1], got[2], got[3]);
+    std::printf("  %-26s        ref[0..3]=%.5f %.5f %.5f %.5f\n", "",
+                ref[0], ref[1], ref[2], ref[3]);
+
+    Report("GEMVQuant [64x128]", Compare(got, ref), 1e-3);
+}
+
 // ---- RMSNorm -------------------------------------------------------------
 void TestRMSNorm(Device& dev, shaders::Library& lib, Gpu& gpu)
 {
@@ -1661,6 +1743,7 @@ int main()
 
         std::printf("\nkernel parity vs CPU reference:\n");
         TestGEMV(dev, lib, gpu);
+        TestGEMVQuant(dev, lib, gpu);
         TestRMSNorm(dev, lib, gpu);
         TestSwiGLU(dev, lib, gpu);
         TestAdd(dev, lib, gpu);
